@@ -1,0 +1,74 @@
+# ============================================================
+# ViperQtHelloWorld - vqt6 的第一个示例
+#
+# 创建一个 Qt6 窗口：
+#   - 标题: "vqt6 Hello"
+#   - 大小: 400x300
+#   - 居中文本: "你好，Viper！"
+#   - 一个按钮: "退出"（点击关闭应用）
+#
+# 使用 vqt6 (Viper 的 Qt6 绑定) 创建窗口
+# ============================================================
+
+import t
+import c
+import vqt6
+import stdlib
+import memhub
+import w32.win32console as w32cmd
+import viperlib
+
+define pagecode = 65001
+
+# 本模块的内存池句柄: list[str] 等泛型容器都从 _mbuddy 里分配, 必须在 main
+# 开头先初始化(项目约定, 见 includes/ast/__init__.vp 顶部说明)。不初始化时它
+# 就是全零, QApplication([]) 构造 [] 时会通过它做虚调用 → 空指针崩溃。
+_mbuddy: memhub.MemBuddy*
+define POOL_SIZE = 1 * 1024 * 1024
+
+
+@t.CExport
+def main() -> int:
+    global _mbuddy
+
+    w32cmd.SetConsoleOutputCP(pagecode)
+    w32cmd.SetConsoleCP(pagecode)
+
+    # 模块内存池 (QApplication([]) 里的 [] 要在这里分配)
+    arena: bytes = stdlib.malloc(POOL_SIZE)
+    if arena is None:
+        print("[vqt6] 内存池分配失败")
+        return 1
+    _mbuddy = memhub.MemBuddy(arena, POOL_SIZE)
+
+    print("[vqt6] 正在创建 QApplication...")
+
+    # 1. 创建 QApplication
+    app: vqt6.QApplication = vqt6.QApplication([])
+
+    print("[vqt6] 正在创建窗口...")
+
+    # 2. 创建主窗口
+    window: vqt6.QWidget = vqt6.QWidget()
+    window.setWindowTitle("vqt6 Hello")
+    window.resize(400, 300)
+    window.setGeometry(100, 100, 400, 300)
+
+    # 3. 创建居中文本标签
+    label: vqt6.QLabel = vqt6.QLabel("你好，Viper！", window)
+    label.setAlignment(vqt6.QT_ALIGN_CENTER)
+
+    # 4. 创建退出按钮
+    button: vqt6.QPushButton = vqt6.QPushButton("退出", window)
+
+    # 5. 显示窗口
+    window.show()
+
+    print("[vqt6] 窗口已显示，进入事件循环")
+    print("[vqt6] 关闭窗口以退出程序")
+
+    # 6. 进入事件循环
+    ret: int = app.exec()
+
+    print(f"[vqt6] 应用退出，返回码: {ret}")
+    return ret

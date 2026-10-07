@@ -1,0 +1,1765 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# MnistNet - 模型层（MLP: 784 -> hidden -> 10  /  CNN: conv+pool+FC）
+#
+# 职责:
+#   * Net 构建 / 前向 / 精度统计（torch-lite 张量 + torch 的 conv/pool 裸缓冲算子）
+#   * 训练主循环 train_run（含进度总线, 供 CLI 打印与 GUI 轮询共用）
+#   * 模型存取 save_model / load_model（mk2 带头部架构字段, 加载时校验）
+#   * 单样本推理 predict_net（10 类概率 + hidden 激活, 供 3D 图点亮）
+#   * 3D 结构图数据 downsample_8x8 / build_graph_edges*
+#
+# 进度总线: train_run 每个记录点写入 prog_* 数组, UI 线程只读轮询;
+#   prog_stop 置 1 可请求提前结束(训练线程在下一个 step 边界退出)。
+# ============================================================
+import t, c
+from stdint import *
+import stdlib
+import string
+import stdio
+import math
+import memhub
+import torch
+import w32.fileio as fileio
+# 输入/输出维度与数据层保持单一定义, 避免两处各写一份导致漂移
+from lib.MnistData import N_IN, N_OUT
+
+# ------------------------------------------------------------
+# 架构标识(持久化在模型文件里, 加载时校验不匹配就明确报错)
+# ------------------------------------------------------------
+define ARCH_MLP = 0
+define ARCH_CNN = 1
+
+# 模型二进制格式 mk2(两种架构通用):
+#   [magic2 u32][arch u32][hidden u32][c1 u32][c2 u32] + 参数张量块
+#   各张量形状由 (arch, hidden, c1, c2) 唯一确定, 不必逐个存维度;
+#   加载时按同样口径推出期望字节数, 少一个字节都判失败。
+# 旧格式 mk1(只有 MLP, 兼容历史文件):
+#   [magic u32][w1r,w1c,w2r,w2c (4 x u32)] + W1 + b1 + W2 + b2
+MAGIC2: uint32 = 0x324E4D54
+MAGIC: uint32 = 0x4D4E4954
+
+# ------------------------------------------------------------
+# CNN 形状(固定拓扑, 通道数与 FC 宽度可调):
+#   1x28x28 --conv1(c1@3x3,pad1)--> c1x28x28 --maxpool2--> c1x14x14
+#           --conv2(c2@3x3,pad1)--> c2x14x14 --maxpool2--> c2x7x7(=49*c2)
+#           --fc1--> hidden --fc2--> 10
+# ------------------------------------------------------------
+define CNN_IN_SIDE = 28
+define CNN_SIDE1 = 14          # pool1 之后的边长
+define CNN_SIDE2 = 7           # pool2 之后的边长(也是 FC1 的输入边长)
+define CNN_K = 3
+define CNN_PAD = 1
+define CNN_POOL = 2
+
+# ------------------------------------------------------------
+# 训练超参(两种架构共用)
+# ------------------------------------------------------------
+# 动量(重球法)。之前用纯 SGD 固定 lr, 收敛慢且准确率上不去 —— 重球法对
+# MNIST 这种"梯度方向稳定"的问题是标准做法, 也是官方例子里的默认配置。
+define MOMENTUM = 0.9
+# 留出验证集: 取训练数据尾部的 1/VAL_RATIO 张不参与训练, 每 epoch 末在上面
+# 测一次(曲线稀疏点)。训练集至少要 VAL_MIN_BATCHES 个批才留(否则没得训)。
+define VAL_RATIO = 10
+define VAL_MIN_BATCHES = 4
+
+# 3D 结构图输入层抽稀网格(28 按 8 等分取整分块)
+define GRAPH_IN = 64          # 8 x 8
+define GRAPH_IN_SIDE = 8
+
+
+# ============================================================
+# Net - 网络参数 + CNN 工作区
+#
+# 两种架构共用一个结构(同时只有一个实例, 省掉跨模块联合类型的麻烦):
+#   MLP: W1(h,784) b1(h) W2(10,h) b2(10)
+#   CNN: wc1(c1,9) bc1(c1) wc2(c2,9*c1) bc2(c2) wf1(h,49*c2) bf1(h) wf2(10,h) bf2(10)
+# 未用到的架构字段留 NULL(__new__ 已整体清零); CNN 工作区只在 CNN 下分配。
+# 字段一律 8 字节, 故 NET_BYTES = 字段数 * 8 = 60 * 8。
+# ============================================================
+define NET_BYTES = 480
+
+
+def _zeros_raw(pool: memhub.MemBuddy*, nb: sizet) -> t.CPtr:
+    """从内存池分配并清零一块裸缓冲(动量缓冲用; pool.alloc 不保证清零)"""
+    p: t.CPtr = pool.alloc(nb)
+    if p is not None:
+        string.memset(p, 0, nb)
+    return p
+
+
+@t.NoVTable
+class Net:
+    # --- 通用 (1-4) ---
+    Arch: sizet                       # 1  ARCH_MLP / ARCH_CNN
+    Hidden: sizet                     # 2  MLP 隐藏层宽度; CNN 的 FC1 宽度
+    C1: sizet                         # 3  CNN conv1 通道数
+    C2: sizet                         # 4  CNN conv2 通道数
+    # --- MLP 参数 (5-8) ---
+    w1: torch.Tensor*            # 5
+    b1: torch.Tensor*            # 6
+    w2: torch.Tensor*            # 7
+    b2: torch.Tensor*            # 8
+    # --- CNN 参数 (9-16) ---
+    wc1: torch.Tensor*           # 9
+    bc1: torch.Tensor*           # 10
+    wc2: torch.Tensor*           # 11
+    bc2: torch.Tensor*           # 12
+    wf1: torch.Tensor*           # 13
+    bf1: torch.Tensor*           # 14
+    wf2: torch.Tensor*           # 15
+    bf2: torch.Tensor*           # 16
+    # --- CNN 前向激活 (17-26) ---
+    BZ1: t.CPtr                          # 17 conv1 输出 c1*28*28
+    BA1: t.CPtr                          # 18 relu(BZ1)
+    BP1: t.CPtr                          # 19 pool1 输出 c1*14*14
+    BZ2: t.CPtr                          # 20 conv2 输出 c2*14*14
+    BA2: t.CPtr                          # 21 relu(BZ2)
+    BP2: t.CPtr                          # 22 pool2 输出 c2*7*7(FC1 的输入)
+    BZ3: t.CPtr                          # 23 fc1 输出 h
+    BA3: t.CPtr                          # 24 relu(BZ3)
+    BLG: t.CPtr                          # 25 logits 10
+    BDA3: t.CPtr                         # 26 fc1 输出的梯度 h
+    # --- CNN 反向梯度 (27-34) ---
+    BDLG: t.CPtr                         # 27 dlogits 10
+    BGZ3: t.CPtr                         # 28 fc1 反传的预激活梯度 h
+    BGP2: t.CPtr                         # 29 fc1 反传的输入梯度 49*c2
+    BGA2: t.CPtr                         # 30 relu2 的输入梯度 c2*14*14
+    BGZ2: t.CPtr                         # 31 pool2 反传结果 c2*14*14
+    BGP1: t.CPtr                         # 32 conv2 反传的输入梯度 c1*14*14
+    BGA1: t.CPtr                         # 33 relu1 的输入梯度 c1*28*28
+    BGZ1: t.CPtr                         # 34 pool1 反传结果 c1*28*28
+    # --- CNN 池化 argmax (35-36) ---
+    ARG1: t.CPtr                         # 35 pool1 窗口内下标(int) c1*14*14
+    ARG2: t.CPtr                         # 36 pool2 窗口内下标(int) c2*7*7
+    # --- FC 层 2D 视图壳 (37-44, 每步复用不再分配) ---
+    VF: torch.Tensor*            # 37 (1, 49*c2) 复用 BP2
+    VZ3: torch.Tensor*           # 38 (1, h) 复用 BZ3
+    VA3: torch.Tensor*           # 39 (1, h) 复用 BA3
+    VLG: torch.Tensor*           # 40 (1, 10) 复用 BLG
+    VDLG: torch.Tensor*          # 41 (1, 10) 复用 BDLG
+    VDA3: torch.Tensor*          # 42 (1, h) 复用 BDA3
+    VGZ3: torch.Tensor*          # 43 (1, h) 复用 BGZ3
+    VGP2: torch.Tensor*          # 44 (1, 49*c2) 复用 BGP2
+    # --- FC 参数梯度壳 (45-48) ---
+    GWF1: torch.Tensor*          # 45
+    GBF1: torch.Tensor*          # 46
+    GWF2: torch.Tensor*          # 47
+    GBF2: torch.Tensor*          # 48
+    # --- MLP 动量缓冲 (49-52) ---
+    # 重球法的速度项, 与参数同元素个数, 训练开始前清零; 只训练时用
+    Mw1: t.CPtr                          # 49
+    Mb1: t.CPtr                          # 50
+    Mw2: t.CPtr                          # 51
+    Mb2: t.CPtr                          # 52
+    # --- CNN 动量缓冲 (53-60) ---
+    Mwc1: t.CPtr                         # 53
+    Mbc1: t.CPtr                         # 54
+    Mwc2: t.CPtr                         # 55
+    Mbc2: t.CPtr                         # 56
+    Mwf1: t.CPtr                         # 57
+    Mbf1: t.CPtr                         # 58
+    Mwf2: t.CPtr                         # 59
+    Mbf2: t.CPtr                         # 60
+
+    def __new__(self, pool: memhub.MemBuddy*, hidden: sizet,
+                arch: sizet = ARCH_MLP, c1: sizet = 0,
+                c2: sizet = 0) -> t.CPtr:
+        # 网络对象要跨帧存活(Qt 面板里存在 AppGui.Net 字段上, 训练线程还要读),
+        # 而类实例默认是创建函数的栈 alloca —— 必须堆分配。
+        # 整体清零: 未用到的架构字段保持 NULL, 由 ok()/前向按 arch 判断。
+        p: t.CPtr = pool.alloc(NET_BYTES)
+        if p is not None:
+            string.memset(p, 0, NET_BYTES)
+        return p
+
+    def __init__(self, pool: memhub.MemBuddy*, hidden: sizet,
+                 arch: sizet = ARCH_MLP, c1: sizet = 0,
+                 c2: sizet = 0):
+        self.Arch = arch
+        self.Hidden = hidden
+        self.C1 = c1
+        self.C2 = c2
+        if arch == ARCH_CNN:
+            self.init_cnn(pool)
+            return
+        self.w1 = torch.zeros(pool, hidden, N_IN, 1)
+        self.b1 = torch.zeros(pool, hidden, 1, 1)
+        self.w2 = torch.zeros(pool, N_OUT, hidden, 1)
+        self.b2 = torch.zeros(pool, N_OUT, 1, 1)
+        # 动量缓冲(重球法速度项, 与参数同元素个数)
+        self.Mw1 = _zeros_raw(pool, hidden * N_IN * sizet(8))
+        self.Mb1 = _zeros_raw(pool, hidden * sizet(8))
+        self.Mw2 = _zeros_raw(pool, N_OUT * hidden * sizet(8))
+        self.Mb2 = _zeros_raw(pool, N_OUT * sizet(8))
+
+    def init_cnn(self, pool: memhub.MemBuddy*):
+        """分配 CNN 参数与工作区(buffer 与 FC 视图壳都复用, 不逐 step 分配)"""
+        c1: sizet = self.C1
+        c2: sizet = self.C2
+        h: sizet = self.Hidden
+        kk: sizet = sizet(CNN_K * CNN_K)
+        fm1: sizet = sizet(CNN_IN_SIDE * CNN_IN_SIDE)     # 28*28
+        fm2: sizet = sizet(CNN_SIDE1 * CNN_SIDE1)         # 14*14
+        fm3: sizet = sizet(CNN_SIDE2 * CNN_SIDE2)         # 7*7
+        n1: sizet = c1 * fm1                                 # conv1/relu1 元素数
+        n1p: sizet = c1 * fm2                                # pool1 输出
+        n2: sizet = c2 * fm2                                 # conv2/relu2 元素数
+        n2p: sizet = c2 * fm3                                # pool2 输出 = FC1 输入
+        # 参数(形状同 PyTorch: conv 权重 [cout][cin][k][k], Linear 权重 [out][in])
+        self.wc1 = torch.zeros(pool, c1, kk, 1)
+        self.bc1 = torch.zeros(pool, c1, 1, 1)
+        self.wc2 = torch.zeros(pool, c2, c1 * kk, 1)
+        self.bc2 = torch.zeros(pool, c2, 1, 1)
+        self.wf1 = torch.zeros(pool, h, n2p, 1)
+        self.bf1 = torch.zeros(pool, h, 1, 1)
+        self.wf2 = torch.zeros(pool, N_OUT, h, 1)
+        self.bf2 = torch.zeros(pool, N_OUT, 1, 1)
+        # 动量缓冲(重球法速度项, 与 8 个参数同元素个数)
+        self.Mwc1 = _zeros_raw(pool, c1 * kk * sizet(8))
+        self.Mbc1 = _zeros_raw(pool, c1 * sizet(8))
+        self.Mwc2 = _zeros_raw(pool, c2 * c1 * kk * sizet(8))
+        self.Mbc2 = _zeros_raw(pool, c2 * sizet(8))
+        self.Mwf1 = _zeros_raw(pool, h * n2p * sizet(8))
+        self.Mbf1 = _zeros_raw(pool, h * sizet(8))
+        self.Mwf2 = _zeros_raw(pool, N_OUT * h * sizet(8))
+        self.Mbf2 = _zeros_raw(pool, N_OUT * sizet(8))
+        # 前向激活缓冲
+        self.BZ1 = pool.alloc(n1 * 8)
+        self.BA1 = pool.alloc(n1 * 8)
+        self.BP1 = pool.alloc(n1p * 8)
+        self.BZ2 = pool.alloc(n2 * 8)
+        self.BA2 = pool.alloc(n2 * 8)
+        self.BP2 = pool.alloc(n2p * 8)
+        self.BZ3 = pool.alloc(h * 8)
+        self.BA3 = pool.alloc(h * 8)
+        self.BLG = pool.alloc(N_OUT * 8)
+        self.BDA3 = pool.alloc(h * 8)
+        # 反向梯度缓冲
+        self.BDLG = pool.alloc(N_OUT * 8)
+        self.BGZ3 = pool.alloc(h * 8)
+        self.BGP2 = pool.alloc(n2p * 8)
+        self.BGA2 = pool.alloc(n2 * 8)
+        self.BGZ2 = pool.alloc(n2 * 8)
+        self.BGP1 = pool.alloc(n1p * 8)
+        self.BGA1 = pool.alloc(n1 * 8)
+        self.BGZ1 = pool.alloc(n1 * 8)
+        # 池化 argmax(int)
+        self.ARG1 = pool.alloc(n1p * 4)
+        self.ARG2 = pool.alloc(n2p * 4)
+        # FC 层的 2D 视图壳(linear_fwd/linear_bwd 只认 Tensor)
+        self.VF = torch.from_raw(pool, self.BP2, 1, n2p, 0)
+        self.VZ3 = torch.from_raw(pool, self.BZ3, 1, h, 0)
+        self.VA3 = torch.from_raw(pool, self.BA3, 1, h, 0)
+        self.VLG = torch.from_raw(pool, self.BLG, 1, N_OUT, 0)
+        self.VDLG = torch.from_raw(pool, self.BDLG, 1, N_OUT, 0)
+        self.VDA3 = torch.from_raw(pool, self.BDA3, 1, h, 0)
+        self.VGZ3 = torch.from_raw(pool, self.BGZ3, 1, h, 0)
+        self.VGP2 = torch.from_raw(pool, self.BGP2, 1, n2p, 0)
+        # FC 参数梯度壳(包住 param.Grad)
+        self.GWF1 = torch.from_raw(pool, torch.tensor_grad(self.wf1), h, n2p, 0)
+        self.GBF1 = torch.from_raw(pool, torch.tensor_grad(self.bf1), h, 1, 0)
+        self.GWF2 = torch.from_raw(pool, torch.tensor_grad(self.wf2), N_OUT, h, 0)
+        self.GBF2 = torch.from_raw(pool, torch.tensor_grad(self.bf2), N_OUT, 1, 0)
+
+    def ok(self) -> int:
+        if self.Arch == ARCH_CNN:
+            if self.wc1 is None or self.bc1 is None:
+                return 0
+            if self.wc2 is None or self.bc2 is None:
+                return 0
+            if self.wf1 is None or self.bf1 is None:
+                return 0
+            if self.wf2 is None or self.bf2 is None:
+                return 0
+            if self.BZ1 is None or self.BP1 is None or self.BP2 is None:
+                return 0
+            if self.BLG is None or self.ARG1 is None or self.ARG2 is None:
+                return 0
+            return 1
+        if self.w1 is None or self.b1 is None or self.w2 is None or self.b2 is None:
+            return 0
+        return 1
+
+    def hidden_size(self) -> sizet:
+        return self.Hidden
+
+
+# ------------------------------------------------------------
+# 跨模块访问器(避免从其它模块直接读 Net 的字段)
+# ------------------------------------------------------------
+def net_ok(net: Net*) -> int:
+    if net is None:
+        return 0
+    return net.ok()
+
+
+def net_w1(net: Net*) -> torch.Tensor*:
+    if net is None:
+        return None
+    return net.w1
+
+
+def net_b1(net: Net*) -> torch.Tensor*:
+    if net is None:
+        return None
+    return net.b1
+
+
+def net_w2(net: Net*) -> torch.Tensor*:
+    if net is None:
+        return None
+    return net.w2
+
+
+def net_b2(net: Net*) -> torch.Tensor*:
+    if net is None:
+        return None
+    return net.b2
+
+
+def net_hidden(net: Net*) -> sizet:
+    if net is None:
+        return 0
+    return net.hidden_size()
+
+
+def net_arch(net: Net*) -> int:
+    if net is None:
+        return ARCH_MLP
+    return int(net.Arch)
+
+
+def net_c1(net: Net*) -> sizet:
+    if net is None:
+        return 0
+    return net.C1
+
+
+def net_c2(net: Net*) -> sizet:
+    if net is None:
+        return 0
+    return net.C2
+
+
+def cnn_fc_in(net: Net*) -> sizet:
+    """CNN 的 FC1 输入维度 = c2 * 7 * 7"""
+    if net is None:
+        return 0
+    return net.C2 * sizet(CNN_SIDE2 * CNN_SIDE2)
+
+
+def init_weights(w1: torch.Tensor*, w2: torch.Tensor*,
+                 hidden: sizet):
+    """MLP 的 Kaiming 均匀初始化(隐藏层 h, 输出层 10);
+    模块级入口, 供 CLI 与 Qt 面板跨模块调用"""
+    torch.kaiming_uniform_fill(w1, N_IN, hidden)
+    torch.kaiming_uniform_fill(w2, hidden, N_OUT)
+
+
+def init_net_weights(net: Net*):
+    """按架构初始化权重(MLP / CNN 各自一套)"""
+    if net is None:
+        return
+    if net.Arch == ARCH_CNN:
+        kk: sizet = sizet(CNN_K * CNN_K)
+        c1: sizet = net.C1
+        c2: sizet = net.C2
+        h: sizet = net.Hidden
+        fin: sizet = cnn_fc_in(net)
+        # conv 层按 fan_in = cin*k*k 做 Kaiming; 偏置留 0(relu 前零偏置是常规做法)
+        torch.kaiming_uniform_fill(net.wc1, kk, c1)
+        torch.kaiming_uniform_fill(net.wc2, c1 * kk, c2)
+        torch.kaiming_uniform_fill(net.wf1, fin, h)
+        torch.kaiming_uniform_fill(net.wf2, h, N_OUT)
+        return
+    init_weights(net.w1, net.w2, net.Hidden)
+
+
+# ============================================================
+# 前向(批) 与 精度统计
+# ============================================================
+def forward_batch(w1: torch.Tensor*, b1: torch.Tensor*,
+                  w2: torch.Tensor*, b2: torch.Tensor*,
+                  xb: torch.Tensor*,
+                  pre1: torch.Tensor*,
+                  act1: torch.Tensor*,
+                  logits: torch.Tensor*):
+    torch.linear_fwd(w1, b1, xb, pre1)
+    torch.relu_fwd(pre1, act1)
+    torch.linear_fwd(w2, b2, act1, logits)
+
+
+def batch_accuracy(logits: torch.Tensor*,
+                   labels: int*,
+                   mb: sizet) -> sizet:
+    preds: int* = stdlib.malloc(mb * 4)
+    if preds is None:
+        return 0
+    torch.row_argmax(logits, preds)
+    ok: sizet = 0
+    for i in range(mb):
+        if preds[i] == labels[i]:
+            ok += 1
+    stdlib.free(preds)
+    return ok
+
+
+# ============================================================
+# CNN: 裸缓冲 relu + 前向 + 反向(单样本)
+#
+# 批内逐样本前向/反向, 参数梯度用 += 语义累积到 param.Grad, 批次结束再
+# 重球法更新(cnn_sgd, 步长 lr/批大小) —— 这样 4D 卷积不必写成批处理版本。
+# 反向顺序: logits -> fc2 -> relu3 -> fc1 -> pool2 -> relu2 -> conv2
+#           -> pool1 -> relu1 -> conv1
+# ============================================================
+def relu_raw(x: t.CPtr, out: t.CPtr, n: sizet):
+    """out = max(0, x) 逐元素(裸缓冲版, 免去给 4D 缓冲造 2D 视图壳)"""
+    if x is None or out is None:
+        return
+    xd: double* = x
+    od: double* = out
+    for i in range(n):
+        v: double = xd[i]
+        if v > double(0.0):
+            od[i] = v
+        else:
+            od[i] = double(0.0)
+
+
+def relu_raw_bwd(za: t.CPtr, g: t.CPtr, gz: t.CPtr, n: sizet):
+    """gz = g * (za > 0) —— za 是 relu 的输入(预激活)缓冲"""
+    if za is None or g is None or gz is None:
+        return
+    zd: double* = za
+    gd: double* = g
+    od: double* = gz
+    for i in range(n):
+        if zd[i] > double(0.0):
+            od[i] = gd[i]
+        else:
+            od[i] = double(0.0)
+
+
+def cnn_forward(net: Net*, img: t.CPtr):
+    """img: 784 个 0..1 归一化灰度(double 缓冲); logits 落在 net.BLG"""
+    if net is None or img is None:
+        return
+    c1: sizet = net.C1
+    c2: sizet = net.C2
+    h: sizet = net.Hidden
+    k: sizet = sizet(CNN_K)
+    pad: sizet = sizet(CNN_PAD)
+    pz: sizet = sizet(CNN_POOL)
+    s: sizet = sizet(CNN_IN_SIDE)
+    s1: sizet = sizet(CNN_SIDE1)
+    n1: sizet = c1 * s * s
+    n2: sizet = c2 * s1 * s1
+    # conv1 -> relu -> pool1
+    torch.conv2d_fwd(img, torch.tensor_data(net.wc1), torch.tensor_data(net.bc1),
+                     net.BZ1, 1, 1, s, s, c1, k, 1, pad)
+    relu_raw(net.BZ1, net.BA1, n1)
+    torch.maxpool2d_fwd(net.BA1, net.BP1, net.ARG1, 1, c1, s, s, pz, pz)
+    # conv2 -> relu -> pool2
+    torch.conv2d_fwd(net.BP1, torch.tensor_data(net.wc2), torch.tensor_data(net.bc2),
+                     net.BZ2, 1, c1, s1, s1, c2, k, 1, pad)
+    relu_raw(net.BZ2, net.BA2, n2)
+    torch.maxpool2d_fwd(net.BA2, net.BP2, net.ARG2, 1, c2, s1, s1, pz, pz)
+    # fc1 -> relu -> fc2(logits)
+    torch.linear_fwd(net.wf1, net.bf1, net.VF, net.VZ3)
+    relu_raw(net.BZ3, net.BA3, h)
+    torch.linear_fwd(net.wf2, net.bf2, net.VA3, net.VLG)
+
+
+def cnn_zero_grads(net: Net*):
+    """批次开始前: 8 个参数张量的 Grad 清零(之后逐样本 += 累积)"""
+    if net is None:
+        return
+    torch.zero_grad(net.wc1)
+    torch.zero_grad(net.bc1)
+    torch.zero_grad(net.wc2)
+    torch.zero_grad(net.bc2)
+    torch.zero_grad(net.wf1)
+    torch.zero_grad(net.bf1)
+    torch.zero_grad(net.wf2)
+    torch.zero_grad(net.bf2)
+
+
+def cnn_backward(net: Net*, img: t.CPtr, label: int) -> double:
+    """反向累积一个样本的参数梯度, 返回该样本交叉熵损失
+    img 必须与 cnn_forward 传入的是同一块缓冲(conv1 反向要用它)"""
+    if net is None:
+        return double(0.0)
+    c1: sizet = net.C1
+    c2: sizet = net.C2
+    h: sizet = net.Hidden
+    k: sizet = sizet(CNN_K)
+    pad: sizet = sizet(CNN_PAD)
+    pz: sizet = sizet(CNN_POOL)
+    s: sizet = sizet(CNN_IN_SIDE)
+    s1: sizet = sizet(CNN_SIDE1)
+    n1: sizet = c1 * s * s
+    n2: sizet = c2 * s1 * s1
+    loss_buf: t.CPtr = stdlib.malloc(8)
+    lab: int* = stdlib.malloc(4)
+    if loss_buf is None or lab is None:
+        if loss_buf is not None:
+            stdlib.free(loss_buf)
+        if lab is not None:
+            stdlib.free(lab)
+        return double(0.0)
+    lab[0] = label
+    torch.softmax_crossentropy(net.VLG, lab, 1, loss_buf, net.VDLG)
+    lb: double* = loss_buf
+    lv: double = lb[0]
+    stdlib.free(lab)
+    stdlib.free(loss_buf)
+    # fc2 反向 -> relu3 反向 -> fc1 反向
+    torch.linear_bwd(net.wf2, net.VA3, net.VDLG, net.GWF2, net.GBF2,
+                     net.VDA3, 1)
+    relu_raw_bwd(net.BZ3, net.BDA3, net.BGZ3, h)
+    torch.linear_bwd(net.wf1, net.VF, net.VGZ3, net.GWF1, net.GBF1,
+                     net.VGP2, 1)
+    # pool2 反向 -> relu2 反向 -> conv2(dw/db 累积) -> conv2 输入梯度
+    torch.maxpool2d_bwd(net.BGP2, net.ARG2, net.BGZ2, 1, c2, s1, s1, pz, pz)
+    relu_raw_bwd(net.BZ2, net.BGZ2, net.BGA2, n2)
+    torch.conv2d_bwd_dw(net.BP1, net.BGA2, torch.tensor_grad(net.wc2),
+                        torch.tensor_grad(net.bc2), 1, c1, s1, s1, c2, k, 1, pad)
+    torch.conv2d_bwd_dx(torch.tensor_data(net.wc2), net.BGA2, net.BGP1,
+                        1, c1, s1, s1, c2, k, 1, pad)
+    # pool1 反向 -> relu1 反向 -> conv1(dw/db 累积, 输入端无需梯度)
+    torch.maxpool2d_bwd(net.BGP1, net.ARG1, net.BGZ1, 1, c1, s, s, pz, pz)
+    relu_raw_bwd(net.BZ1, net.BGZ1, net.BGA1, n1)
+    torch.conv2d_bwd_dw(img, net.BGA1, torch.tensor_grad(net.wc1),
+                        torch.tensor_grad(net.bc1), 1, 1, s, s, c1, k, 1, pad)
+    return lv
+
+
+def cnn_sgd(net: Net*, lr: double):
+    """用累积好的梯度更新 8 个参数(重球法; lr 由调用方按 lr/批大小 折算)"""
+    if net is None:
+        return
+    torch.sgd_step_momentum(net.wc1, net.Mwc1, lr, MOMENTUM)
+    torch.sgd_step_momentum(net.bc1, net.Mbc1, lr, MOMENTUM)
+    torch.sgd_step_momentum(net.wc2, net.Mwc2, lr, MOMENTUM)
+    torch.sgd_step_momentum(net.bc2, net.Mbc2, lr, MOMENTUM)
+    torch.sgd_step_momentum(net.wf1, net.Mwf1, lr, MOMENTUM)
+    torch.sgd_step_momentum(net.bf1, net.Mbf1, lr, MOMENTUM)
+    torch.sgd_step_momentum(net.wf2, net.Mwf2, lr, MOMENTUM)
+    torch.sgd_step_momentum(net.bf2, net.Mbf2, lr, MOMENTUM)
+
+
+# ============================================================
+# 模型存取
+# ============================================================
+def arch_name(a: int) -> str:
+    if a == ARCH_CNN:
+        return "CNN(卷积)"
+    return "MLP(全连接)"
+
+
+def _bytes_of(x: torch.Tensor*) -> sizet:
+    """张量占用的字节数(参数总是 double)"""
+    if x is None:
+        return 0
+    return torch.tensor_rows(x) * torch.tensor_cols(x) * sizet(8)
+
+
+def _write_tensor(f: fileio.File*, x: torch.Tensor*) -> sizet:
+    """写一个张量, 返回声明写入的字节数(0 表示失败)"""
+    nb: sizet = _bytes_of(x)
+    if nb == 0:
+        return 0
+    got: LONG = f.write(torch.tensor_data(x), ULONG(nb))
+    if sizet(got) != nb:
+        return 0
+    return nb
+
+
+def _read_tensor(whole: t.CPtr, off: sizet,
+                 x: torch.Tensor*) -> sizet:
+    """从整块缓冲的 off 处读一个张量, 返回新偏移(0 表示失败)"""
+    nb: sizet = _bytes_of(x)
+    if nb == 0:
+        return 0
+    string.memcpy(torch.tensor_data(x), whole + off, nb)
+    return off + nb
+
+
+def model_payload_bytes(net: Net*) -> sizet:
+    """mk2 文件去掉 20 字节头之后的参数块总字节数"""
+    if net is None:
+        return 0
+    if net.Arch == ARCH_CNN:
+        return _bytes_of(net.wc1) + _bytes_of(net.bc1) + \
+            _bytes_of(net.wc2) + _bytes_of(net.bc2) + \
+            _bytes_of(net.wf1) + _bytes_of(net.bf1) + \
+            _bytes_of(net.wf2) + _bytes_of(net.bf2)
+    return _bytes_of(net.w1) + _bytes_of(net.b1) + \
+        _bytes_of(net.w2) + _bytes_of(net.b2)
+
+
+def save_model(net: Net*, path: str) -> int:
+    """按当前架构存盘(mk2): [magic2][arch][hidden][c1][c2] + 参数块"""
+    if net is None:
+        return 1
+    f: fileio.File* = fileio.File(path, fileio.MODE.W)
+    if f.closed:
+        stdio.printf("[model] 无法创建: %s\n", path)
+        return 1
+    hdr: uint32* = stdlib.malloc(20)
+    if hdr is None:
+        f.close()
+        return 1
+    string.memset(hdr, 0, 20)
+    hdr[0] = MAGIC2
+    hdr[1] = uint32(net.Arch)
+    hdr[2] = uint32(net.Hidden)
+    hdr[3] = uint32(net.C1)
+    hdr[4] = uint32(net.C2)
+    f.write(hdr, 20)
+    stdlib.free(hdr)
+    written: sizet = 0
+    if net.Arch == ARCH_CNN:
+        written += _write_tensor(f, net.wc1)
+        written += _write_tensor(f, net.bc1)
+        written += _write_tensor(f, net.wc2)
+        written += _write_tensor(f, net.bc2)
+        written += _write_tensor(f, net.wf1)
+        written += _write_tensor(f, net.bf1)
+        written += _write_tensor(f, net.wf2)
+        written += _write_tensor(f, net.bf2)
+    else:
+        written += _write_tensor(f, net.w1)
+        written += _write_tensor(f, net.b1)
+        written += _write_tensor(f, net.w2)
+        written += _write_tensor(f, net.b2)
+    f.close()
+    if written != model_payload_bytes(net):
+        stdio.printf("[model] 写入字节数异常: 期望 %zu, 实得 %zu\n",
+                     model_payload_bytes(net), written)
+        return 1
+    return 0
+
+
+def load_model_mk1(path: str, w1: torch.Tensor*,
+                   b1: torch.Tensor*,
+                   w2: torch.Tensor*,
+                   b2: torch.Tensor*) -> int:
+    f: fileio.File* = fileio.File(path, fileio.MODE.R)
+    if f.closed:
+        stdio.printf("[model] 无法打开: %s\n", path)
+        return 1
+    sz: LONGLONG = f.size()
+    f.close()
+    if sz < 20:
+        stdio.printf("[model] 文件过小: %s\n", path)
+        return 1
+    # read_all 契约: 最多读 max_count-1 字节, 故 +1
+    whole: t.CPtr = stdlib.malloc(sizet(sz) + 1)
+    if whole is None:
+        return 1
+    fr: fileio.File* = fileio.File(path, fileio.MODE.R)
+    if fr.closed:
+        stdlib.free(whole)
+        return 1
+    got: LONG = fr.read_all(whole, ULONG(sizet(sz) + 1))
+    fr.close()
+    if got <= 0 or sizet(got) != sizet(sz):
+        stdio.printf("[model] 读取失败: %s\n", path)
+        stdlib.free(whole)
+        return 1
+    hd: uint32* = whole
+    if hd[0] != MAGIC:
+        stdio.printf("[model] 非 ViperMNIST 模型文件\n")
+        stdlib.free(whole)
+        return 1
+    w1r: sizet = torch.tensor_rows(w1)
+    w1c: sizet = torch.tensor_cols(w1)
+    b1r: sizet = torch.tensor_rows(b1)
+    w2r: sizet = torch.tensor_rows(w2)
+    w2c: sizet = torch.tensor_cols(w2)
+    b2r: sizet = torch.tensor_rows(b2)
+    expect: sizet = 20 + (w1r * w1c + b1r + w2r * w2c + b2r) * 8
+    if sizet(sz) < expect:
+        stdio.printf("[model] 尺寸不匹配(期望字节=%zu, 实得=%zu)\n",
+                     expect, sizet(sz))
+        stdlib.free(whole)
+        return 1
+    # 校验维度
+    if sizet(hd[1]) != w1r or sizet(hd[2]) != w1c \
+            or sizet(hd[3]) != w2r or sizet(hd[4]) != w2c:
+        stdio.printf("[model] 维度不一致, 请用相同 --hidden 训练\n")
+        stdlib.free(whole)
+        return 1
+    string.memcpy(torch.tensor_data(w1), whole + 20, w1r * w1c * 8)
+    off: sizet = 20 + w1r * w1c * 8
+    string.memcpy(torch.tensor_data(b1), whole + off, b1r * 8)
+    off += b1r * 8
+    string.memcpy(torch.tensor_data(w2), whole + off, w2r * w2c * 8)
+    off += w2r * w2c * 8
+    string.memcpy(torch.tensor_data(b2), whole + off, b2r * 8)
+    stdlib.free(whole)
+    return 0
+
+
+def peek_model(path: str, out_info: int*) -> int:
+    """读模型头, 不加载权重。out_info[0..4] = arch, hidden, c1, c2, 是否 mk2
+    返回 1=成功。mk1(老格式)没有架构字段 → 一律按 MLP/hidden 从维度反推。"""
+    oi: int* = out_info
+    if path is None or oi is None:
+        return 0
+    f: fileio.File* = fileio.File(path, fileio.MODE.R)
+    if f.closed:
+        return 0
+    # read_all 契约: 最多读 max_count-1 字节, 故按 21 请求(拿满 20 字节头)
+    hdr: uint32* = stdlib.malloc(21)
+    if hdr is None:
+        f.close()
+        return 0
+    got: LONG = f.read_all(hdr, 21)
+    f.close()
+    if got < 20:
+        stdlib.free(hdr)
+        return 0
+    if hdr[0] == MAGIC2:
+        oi[0] = int(hdr[1])
+        oi[1] = int(hdr[2])
+        oi[2] = int(hdr[3])
+        oi[3] = int(hdr[4])
+        oi[4] = 1
+        stdlib.free(hdr)
+        return 1
+    if hdr[0] == MAGIC:
+        # mk1: [magic][w1r,w1c,w2r,w2c]; MLP 的 w1 行数就是 hidden
+        oi[0] = ARCH_MLP
+        oi[1] = int(hdr[1])
+        oi[2] = 0
+        oi[3] = 0
+        oi[4] = 0
+        stdlib.free(hdr)
+        return 1
+    stdlib.free(hdr)
+    return 0
+
+
+def load_model_mk2(path: str, net: Net*) -> int:
+    """加载 mk2 文件(架构/维度已由 load_model 校验过)"""
+    f: fileio.File* = fileio.File(path, fileio.MODE.R)
+    if f.closed:
+        stdio.printf("[model] 无法打开: %s\n", path)
+        return 1
+    sz: LONGLONG = f.size()
+    f.close()
+    expect: sizet = 20 + model_payload_bytes(net)
+    if sizet(sz) < expect:
+        stdio.printf("[model] 尺寸不匹配(期望字节=%zu, 实得=%zu)\n",
+                     expect, sizet(sz))
+        return 1
+    whole: t.CPtr = stdlib.malloc(sizet(sz) + 1)
+    if whole is None:
+        return 1
+    fr: fileio.File* = fileio.File(path, fileio.MODE.R)
+    if fr.closed:
+        stdlib.free(whole)
+        return 1
+    got: LONG = fr.read_all(whole, ULONG(sizet(sz) + 1))
+    fr.close()
+    if got <= 0 or sizet(got) != sizet(sz):
+        stdio.printf("[model] 读取失败: %s\n", path)
+        stdlib.free(whole)
+        return 1
+    off: sizet = 20
+    if net.Arch == ARCH_CNN:
+        off = _read_tensor(whole, off, net.wc1)
+        off = _read_tensor(whole, off, net.bc1)
+        off = _read_tensor(whole, off, net.wc2)
+        off = _read_tensor(whole, off, net.bc2)
+        off = _read_tensor(whole, off, net.wf1)
+        off = _read_tensor(whole, off, net.bf1)
+        off = _read_tensor(whole, off, net.wf2)
+        off = _read_tensor(whole, off, net.bf2)
+    else:
+        off = _read_tensor(whole, off, net.w1)
+        off = _read_tensor(whole, off, net.b1)
+        off = _read_tensor(whole, off, net.w2)
+        off = _read_tensor(whole, off, net.b2)
+    stdlib.free(whole)
+    if off == 0:
+        stdio.printf("[model] 权重拷贝失败(维度异常)\n")
+        return 1
+    return 0
+
+
+def load_model(net: Net*, path: str) -> int:
+    """按文件头加载并校验架构: 架构/hidden/通道任一项与当前网络不符即报错"""
+    if net is None:
+        return 1
+    info: int* = stdlib.malloc(20)
+    if info is None:
+        return 1
+    if peek_model(path, info) == 0:
+        stdio.printf("[model] 非 ViperMNIST 模型文件或读取失败: %s\n", path)
+        stdlib.free(info)
+        return 1
+    f_arch: int = info[0]
+    f_hidden: int = info[1]
+    f_c1: int = info[2]
+    f_c2: int = info[3]
+    f_mk2: int = info[4]
+    stdlib.free(info)
+    cur: int = int(net.Arch)
+    if f_arch != cur:
+        stdio.printf("[model] 架构不匹配: 文件是 %s, 当前是 %s（可切换架构或另选文件）\n",
+                     arch_name(f_arch), arch_name(cur))
+        return 1
+    if f_hidden != int(net.Hidden):
+        stdio.printf("[model] hidden 不匹配: 文件 %d, 当前 %d\n",
+                     f_hidden, int(net.Hidden))
+        return 1
+    if f_arch == ARCH_CNN:
+        if f_c1 != int(net.C1) or f_c2 != int(net.C2):
+            stdio.printf("[model] 卷积通道不匹配: 文件 c1=%d c2=%d, 当前 c1=%d c2=%d\n",
+                         f_c1, f_c2, int(net.C1), int(net.C2))
+            return 1
+    if f_mk2 == 0:
+        # mk1 老格式(只有 MLP)
+        return load_model_mk1(path, net.w1, net.b1, net.w2, net.b2)
+    return load_model_mk2(path, net)
+
+
+# ============================================================
+# 评测(全量, 供 CLI)
+# ============================================================
+def evaluate(pool: memhub.MemBuddy*,
+             w1: torch.Tensor*, b1: torch.Tensor*,
+             w2: torch.Tensor*, b2: torch.Tensor*,
+             xbuf: double*, ybuf: int*,
+             n_test: sizet, batch: sizet, hidden: sizet,
+             show: sizet) -> double:
+    xd: double* = xbuf
+    yd: int* = ybuf
+
+    xb: torch.Tensor* = torch.zeros(pool, batch, N_IN, 0)
+    pre1: torch.Tensor* = torch.zeros(pool, batch, hidden, 0)
+    act1: torch.Tensor* = torch.zeros(pool, batch, hidden, 0)
+    logits: torch.Tensor* = torch.zeros(pool, batch, N_OUT, 0)
+    preds: int* = stdlib.malloc(batch * 4)
+    labels: int* = stdlib.malloc(batch * 4)
+    if preds is None or labels is None:
+        return double(0.0)
+
+    ok_all: sizet = 0
+    seen_all: sizet = 0
+    shown: sizet = 0
+    xbd: double* = torch.tensor_data(xb)
+    start: sizet = 0
+    while start < n_test:
+        mb: sizet = batch
+        if start + mb > n_test:
+            mb = n_test - start
+        # 视图(末批可能 < batch): 用 from_raw 包同一 Data, 行数取 mb
+        xv: torch.Tensor* = torch.from_raw(pool, torch.tensor_data(xb), mb, N_IN, 0)
+        pv: torch.Tensor* = torch.from_raw(pool, torch.tensor_data(pre1), mb, hidden, 0)
+        av: torch.Tensor* = torch.from_raw(pool, torch.tensor_data(act1), mb, hidden, 0)
+        lv: torch.Tensor* = torch.from_raw(pool, torch.tensor_data(logits), mb, N_OUT, 0)
+
+        for i in range(mb):
+            src: sizet = (start + i) * N_IN
+            for j in range(N_IN):
+                xbd[i * N_IN + j] = xd[src + j]
+            labels[i] = yd[start + i]
+
+        forward_batch(w1, b1, w2, b2, xv, pv, av, lv)
+        torch.row_argmax(lv, preds)
+        for i in range(mb):
+            if shown < show:
+                stdio.printf("  img[%zu] 预测=%d 真实=%d %s\n",
+                             start + i, preds[i], labels[i],
+                             "OK" if preds[i] == labels[i] else "NG")
+                shown += 1
+            if preds[i] == labels[i]:
+                ok_all += 1
+        seen_all += mb
+        start += mb
+
+    acc: double = double(ok_all) / double(seen_all) * double(100.0)
+    stdio.printf("[eval] 正确=%zu/%zu  准确率=%.2f%%\n", ok_all, seen_all, acc)
+    stdlib.free(preds)
+    stdlib.free(labels)
+    return acc
+
+
+# ============================================================
+# 进度总线(训练线程写, UI 线程读)
+# ============================================================
+define PROG_MAX = 1024          # 曲线最多记录点数
+prog_x: double*
+prog_loss: double*
+prog_acc: double*
+prog_n: int = 0                  # 已写入点数
+# 验证集曲线(每 epoch 末一个点, 与训练曲线分开存 —— 点数少且 x 稀疏)
+prog_vx: double*
+prog_vloss: double*
+prog_vacc: double*
+prog_vn: int = 0                 # 已写入验证点数
+prog_step: int = 0               # 当前全局 step
+prog_total: int = 0              # 总 step 数
+prog_epoch: int = 0              # 当前 epoch(1 起)
+prog_epochs: int = 0
+prog_done: int = 0               # 1 = 训练结束
+prog_fail: int = 0               # 1 = 出错
+prog_stop: int = 0               # UI 置 1 请求停止
+
+
+def prog_init():
+    """分配进度数组并复位计数(训练前调用一次)"""
+    global prog_x, prog_loss, prog_acc
+    global prog_vx, prog_vloss, prog_vacc
+    global prog_n, prog_vn, prog_step, prog_total, prog_epoch, prog_epochs
+    global prog_done, prog_fail, prog_stop
+    if prog_x is None:
+        prog_x = stdlib.malloc(PROG_MAX * 8)
+        prog_loss = stdlib.malloc(PROG_MAX * 8)
+        prog_acc = stdlib.malloc(PROG_MAX * 8)
+    if prog_vx is None:
+        prog_vx = stdlib.malloc(PROG_MAX * 8)
+        prog_vloss = stdlib.malloc(PROG_MAX * 8)
+        prog_vacc = stdlib.malloc(PROG_MAX * 8)
+    prog_n = 0
+    prog_vn = 0
+    prog_step = 0
+    prog_total = 0
+    prog_epoch = 0
+    prog_epochs = 0
+    prog_done = 0
+    prog_fail = 0
+    prog_stop = 0
+
+
+def prog_point(i: int, out_xyz: double*) -> int:
+    """取第 i 个记录点: out_xyz[0]=step out_xyz[1]=loss out_xyz[2]=acc%。越界返回 0"""
+    if i < 0 or i >= prog_n:
+        return 0
+    px: double* = prog_x
+    pl: double* = prog_loss
+    pa: double* = prog_acc
+    o: double* = out_xyz
+    o[0] = px[i]
+    o[1] = pl[i]
+    o[2] = pa[i]
+    return 1
+
+
+def prog_push_val(step_x: int, vloss: double, vacc: double):
+    """记录一个验证点(每 epoch 末一个); 曲线满则丢弃"""
+    global prog_vn
+    if prog_vx is None or prog_vn >= PROG_MAX:
+        return
+    vx: double* = prog_vx
+    vl: double* = prog_vloss
+    va: double* = prog_vacc
+    vx[prog_vn] = double(step_x)
+    vl[prog_vn] = vloss
+    va[prog_vn] = vacc
+    prog_vn += 1
+
+
+def prog_val_point(i: int, out_xyz: double*) -> int:
+    """取第 i 个验证点: out_xyz[0]=step out_xyz[1]=val loss out_xyz[2]=val acc%。越界返回 0"""
+    if i < 0 or i >= prog_vn:
+        return 0
+    vx: double* = prog_vx
+    vl: double* = prog_vloss
+    va: double* = prog_vacc
+    o: double* = out_xyz
+    o[0] = vx[i]
+    o[1] = vl[i]
+    o[2] = va[i]
+    return 1
+
+
+# ------------------------------------------------------------
+# 训练侧小工具
+# ------------------------------------------------------------
+def ce_from_logits(lg: double*, off: sizet, c: sizet,
+                   label: int) -> double:
+    """从 c 个 logits(起点 off)与真实标签算交叉熵(数值稳定), 供验证集损失用"""
+    if lg is None:
+        return double(0.0)
+    d: double* = lg
+    mx: double = d[off]
+    for j in range(1, c):
+        if d[off + j] > mx:
+            mx = d[off + j]
+    s: double = double(0.0)
+    for j in range(c):
+        s = s + vipermath.exp(d[off + j] - mx)
+    li: sizet = sizet(label)
+    if li >= c:
+        li = 0
+    return -(d[off + li] - mx - vipermath.log(s))
+
+
+def epoch_lr(lr: double, epoch: sizet, epochs: sizet) -> double:
+    """阶梯衰减: 后 1/2 行程降 10 倍, 后 1/4 行程再降 10 倍
+    (与 PyTorch 官方 MNIST 例子的 StepLR(50%, 75%) 同款; epochs<4 时不衰减)"""
+    if epochs < sizet(4):
+        return lr
+    e4: sizet = epoch * sizet(4)
+    if e4 >= epochs * sizet(3):
+        return lr * double(0.01)
+    if e4 >= epochs * sizet(2):
+        return lr * double(0.1)
+    return lr
+
+
+def net_momentum_ready(net: Net*) -> int:
+    """动量缓冲是否齐备(由 Net 分配)。缺了就 fail-fast —— 不能让 sgd 静默
+    退化成无动量的普通 SGD, 否则训练曲线会莫名其妙变差而查不出原因。"""
+    if net is None:
+        return 0
+    if net.Arch == ARCH_CNN:
+        if net.Mwc1 is None or net.Mbc1 is None or net.Mwc2 is None or net.Mbc2 is None:
+            return 0
+        if net.Mwf1 is None or net.Mbf1 is None or net.Mwf2 is None or net.Mbf2 is None:
+            return 0
+        return 1
+    if net.Mw1 is None or net.Mb1 is None or net.Mw2 is None or net.Mb2 is None:
+        return 0
+    return 1
+
+
+# 工具: 确定性 LCG64, 返回 [0, n) 下标
+_rng_u: uint64 = 0
+LCG64_A: uint64 = 6364136223846793005
+LCG64_C: uint64 = 1442695040888963407
+
+
+def rand_seed(seed: uint64):
+    global _rng_u
+    _rng_u = seed
+
+
+def rand_idx(n: sizet) -> sizet:
+    global _rng_u
+    _rng_u = _rng_u * LCG64_A + LCG64_C
+    return sizet((_rng_u >> 33) % uint64(n))
+
+
+# ------------------------------------------------------------
+# 数据增强: 取样时随机平移(±AUG_SHIFT 像素)
+# 背景是黑(0), 整数平移后移出边界的像素丢弃、空出来的位置填 0, 不做插值
+# (避免引入模糊)。这是拿到"形变/平移不变性"最省事的一条路 —— 单靠 maxpool
+# 只能挡住很小的位移。
+# ------------------------------------------------------------
+define AUG_SHIFT = 2
+
+
+def rand_shift_amt() -> int:
+    """返回 [-AUG_SHIFT, AUG_SHIFT] 的随机位移"""
+    span: int = int(AUG_SHIFT) * 2 + 1
+    return int(rand_idx(sizet(span))) - int(AUG_SHIFT)
+
+
+def fill_sample(src: double*, src_off: sizet,
+                dst: double*, dst_off: sizet,
+                dy: int, dx: int):
+    """把 28x28 样本从 src[src_off] 搬到 dst[dst_off], 按 (dy, dx) 平移"""
+    if src is None or dst is None:
+        return
+    xd: double* = src
+    od: double* = dst
+    side: int = int(CNN_IN_SIDE)
+    for y in range(side):
+        for x in range(side):
+            sy: int = y - dy
+            sx: int = x - dx
+            v: double = double(0.0)
+            if sy >= 0 and sy < side and sx >= 0 and sx < side:
+                v = xd[src_off + sizet(sy * side + sx)]
+            od[dst_off + sizet(y * side + x)] = v
+
+
+def cnn_argmax(net: Net*) -> int:
+    """当前 logits(net.BLG)的 argmax"""
+    if net is None:
+        return -1
+    d: double* = net.BLG
+    best: int = 0
+    bv: double = d[0]
+    for j in range(1, N_OUT):
+        if d[j] > bv:
+            bv = d[j]
+            best = int(j)
+    return best
+
+
+# ============================================================
+# 训练主循环
+# ============================================================
+def _train_mlp(pool: memhub.MemBuddy*,
+               net: Net*,
+               xbuf: double*, ybuf: int*,
+               n_train: sizet, batch: sizet, epochs: sizet,
+               lr: double, save_path: str, augment: int,
+               n_val: sizet) -> int:
+    """MLP 训练 epochs 轮(每轮有放回抽样填满整批); 进度写 prog_*; 0=正常结束
+    n_train 之后的 n_val 张是留出验证集(不参与抽样)"""
+    global prog_n, prog_step, prog_total, prog_epoch, prog_epochs
+    global prog_done, prog_fail
+
+    if net is None or n_train == 0 or batch == 0 or epochs == 0:
+        prog_fail = 1
+        prog_done = 1
+        return 1
+    if net_momentum_ready(net) == 0:
+        prog_fail = 1
+        prog_done = 1
+        return 1
+    w1: torch.Tensor* = net.w1
+    b1: torch.Tensor* = net.b1
+    w2: torch.Tensor* = net.w2
+    b2: torch.Tensor* = net.b2
+    hidden: sizet = net.hidden_size()
+
+    xb: torch.Tensor* = torch.zeros(pool, batch, N_IN, 0)
+    pre1: torch.Tensor* = torch.zeros(pool, batch, hidden, 0)
+    act1: torch.Tensor* = torch.zeros(pool, batch, hidden, 0)
+    logits: torch.Tensor* = torch.zeros(pool, batch, N_OUT, 0)
+    grad_out: torch.Tensor* = torch.zeros(pool, batch, N_OUT, 0)
+    da1: torch.Tensor* = torch.zeros(pool, batch, hidden, 0)
+    dpre1: torch.Tensor* = torch.zeros(pool, batch, hidden, 0)
+    dx_dummy: torch.Tensor* = torch.zeros(pool, batch, N_IN, 0)
+    labels: int* = stdlib.malloc(batch * 4)
+    preds: int* = stdlib.malloc(batch * 4)
+    loss_buf: double* = stdlib.malloc(8)
+    if labels is None or preds is None or loss_buf is None:
+        prog_fail = 1
+        prog_done = 1
+        return 1
+
+    # 参数梯度包装(from_raw 包 weight.Grad)
+    gw1: torch.Tensor* = torch.from_raw(pool, torch.tensor_grad(w1),
+                                                torch.tensor_rows(w1),
+                                                torch.tensor_cols(w1), 0)
+    gb1: torch.Tensor* = torch.from_raw(pool, torch.tensor_grad(b1),
+                                                torch.tensor_rows(b1), 1, 0)
+    gw2: torch.Tensor* = torch.from_raw(pool, torch.tensor_grad(w2),
+                                                torch.tensor_rows(w2),
+                                                torch.tensor_cols(w2), 0)
+    gb2: torch.Tensor* = torch.from_raw(pool, torch.tensor_grad(b2),
+                                                torch.tensor_rows(b2), 1, 0)
+
+    xd: double* = xbuf
+    yd: int* = ybuf
+    xbd: double* = torch.tensor_data(xb)
+
+    steps_per_epoch: int = int(n_train) / int(batch)
+    if steps_per_epoch < 1:
+        steps_per_epoch = 1
+    total_steps: int = steps_per_epoch * int(epochs)
+    prog_total = total_steps
+    prog_epochs = int(epochs)
+    stride: int = total_steps / PROG_MAX
+    if stride < 1:
+        stride = 1
+
+    ema_loss: double = double(0.0)
+    ema_acc: double = double(0.0)
+    gstep: int = 0
+
+    epoch: sizet = 0
+    while epoch < epochs:
+        # 本轮学习率(阶梯衰减)
+        lr_e: double = epoch_lr(lr, epoch, epochs)
+        loss_sum: double = double(0.0)
+        ok_sum: sizet = 0
+        samples_seen: sizet = 0
+        step: sizet = 0
+        while step * batch < n_train:
+            if prog_stop != 0:
+                break
+            # 抽取 batch 个样本索引并拷贝(可选随机平移增强)
+            for i in range(batch):
+                ridx: sizet = rand_idx(n_train)
+                src: sizet = ridx * N_IN
+                if augment != 0:
+                    ady: int = rand_shift_amt()
+                    adx: int = rand_shift_amt()
+                    fill_sample(xd, src, xbd, i * N_IN, ady, adx)
+                else:
+                    for j in range(N_IN):
+                        xbd[i * N_IN + j] = xd[src + j]
+                labels[i] = yd[ridx]
+            # 前向
+            forward_batch(w1, b1, w2, b2, xb, pre1, act1, logits)
+            # 损失 + 输出梯度
+            torch.softmax_crossentropy(logits, labels, batch, loss_buf, grad_out)
+            bl: double = loss_buf[0]
+            loss_sum = loss_sum + bl
+            # 反向
+            torch.zero_grad(w1)
+            torch.zero_grad(b1)
+            torch.zero_grad(w2)
+            torch.zero_grad(b2)
+            torch.linear_bwd(w2, act1, grad_out, gw2, gb2, da1)
+            torch.relu_backward(pre1, da1, dpre1)
+            torch.linear_bwd(w1, xb, dpre1, gw1, gb1, dx_dummy)
+            # 参数更新(重球法)
+            torch.sgd_step_momentum(w1, net.Mw1, lr_e, MOMENTUM)
+            torch.sgd_step_momentum(b1, net.Mb1, lr_e, MOMENTUM)
+            torch.sgd_step_momentum(w2, net.Mw2, lr_e, MOMENTUM)
+            torch.sgd_step_momentum(b2, net.Mb2, lr_e, MOMENTUM)
+            # 训练集(本批抽样)精度
+            bok: sizet = batch_accuracy(logits, labels, batch)
+            ok_sum = ok_sum + bok
+            samples_seen += batch
+            step += 1
+            gstep += 1
+
+            # 指数滑动平均后按 stride 记录曲线点
+            bacc: double = double(bok) / double(batch)
+            if gstep == 1:
+                ema_loss = bl
+                ema_acc = bacc
+            else:
+                ema_loss = ema_loss * double(0.9) + bl * double(0.1)
+                ema_acc = ema_acc * double(0.9) + bacc * double(0.1)
+            if gstep % stride == 0 and prog_n < PROG_MAX:
+                px: double* = prog_x
+                pl: double* = prog_loss
+                pa: double* = prog_acc
+                px[prog_n] = double(gstep)
+                pl[prog_n] = ema_loss
+                pa[prog_n] = ema_acc * double(100.0)
+                prog_n += 1
+                prog_step = gstep
+        # 轮末平均
+        n_steps: sizet = step
+        avg_loss: double = double(0.0)
+        acc: double = double(0.0)
+        if n_steps > 0:
+            avg_loss = loss_sum / double(n_steps)
+            acc = double(ok_sum) / double(samples_seen) * double(100.0)
+        # 留出验证集: 每轮末测一次。n_val 由 train_run 保证是 batch 的整数倍,
+        # 故这里可以整批前向(不必处理尾巴), 复用训练用的临时张量。
+        vacc: double = double(0.0)
+        vloss: double = double(0.0)
+        if n_val > 0:
+            vok: sizet = 0
+            for vc in range(n_val / batch):
+                for vb in range(batch):
+                    for vj in range(N_IN):
+                        xbd[vb * N_IN + vj] = xd[n_train * N_IN + vc * batch * N_IN + vb * N_IN + vj]
+                    labels[vb] = yd[n_train + vc * batch + vb]
+                forward_batch(w1, b1, w2, b2, xb, pre1, act1, logits)
+                torch.row_argmax(logits, preds)
+                lgd: double* = torch.tensor_data(logits)
+                for vb in range(batch):
+                    vloss = vloss + ce_from_logits(lgd, vb * N_OUT, N_OUT, labels[vb])
+                    if preds[vb] == labels[vb]:
+                        vok += 1
+            vloss = vloss / double(n_val)
+            vacc = double(vok) / double(n_val) * double(100.0)
+            prog_push_val(gstep, vloss, vacc)
+        prog_epoch = int(epoch) + 1
+        prog_step = gstep
+        stdio.printf("[epoch %d] loss=%.4f  train-acc=%.2f%%  val-loss=%.4f  val-acc=%.2f%%\n",
+                     int(epoch + 1), avg_loss, acc, vloss, vacc)
+        epoch += 1
+        if prog_stop != 0:
+            break
+
+    if save_path is not None and string.strlen(save_path) > 0:
+        if save_model(net, save_path) == 0:
+            stdio.printf("[model] 已保存: %s\n", save_path)
+
+    stdlib.free(labels)
+    stdlib.free(preds)
+    stdlib.free(loss_buf)
+    prog_done = 1
+    return 0
+
+
+def _train_cnn(pool: memhub.MemBuddy*,
+               net: Net*,
+               xbuf: double*, ybuf: int*,
+               n_train: sizet, batch: sizet, epochs: sizet,
+               lr: double, save_path: str, augment: int,
+               n_val: sizet) -> int:
+    """CNN 训练: 批内逐样本前向/反向累积参数梯度, 批末按 (lr/批大小) 更新一次。
+    进度总线口径与 MLP 完全一致(UI 无需区分架构)。
+    n_train 之后的 n_val 张是留出验证集(不参与抽样)"""
+    global prog_n, prog_step, prog_total, prog_epoch, prog_epochs
+    global prog_done, prog_fail
+
+    if net is None or n_train == 0 or batch == 0 or epochs == 0:
+        prog_fail = 1
+        prog_done = 1
+        return 1
+    xd: double* = xbuf
+    yd: int* = ybuf
+    if net_momentum_ready(net) == 0:
+        prog_fail = 1
+        prog_done = 1
+        return 1
+    # 单样本输入缓冲: MnistData.load_mnist_images 已把像素归一化到 0..1,
+    # 这里只做搬运(可选平移增强), 不再二次除以 255 —— conv 只吃 double,
+    # 且反向 conv1 要用与 forward 同一块缓冲。
+    in_buf: t.CPtr = stdlib.malloc(N_IN * 8)
+    if in_buf is None:
+        prog_fail = 1
+        prog_done = 1
+        return 1
+    ind: double* = in_buf
+
+    steps_per_epoch: int = int(n_train) / int(batch)
+    if steps_per_epoch < 1:
+        steps_per_epoch = 1
+    total_steps: int = steps_per_epoch * int(epochs)
+    prog_total = total_steps
+    prog_epochs = int(epochs)
+    stride: int = total_steps / PROG_MAX
+    if stride < 1:
+        stride = 1
+
+    ema_loss: double = double(0.0)
+    ema_acc: double = double(0.0)
+    gstep: int = 0
+
+    epoch: sizet = 0
+    while epoch < epochs:
+        # 本轮学习率: 先阶梯衰减, 再折算 —— 逐样本累积的梯度是"批内求和",
+        # 除以批大小才是平均梯度
+        eff_lr: double = epoch_lr(lr, epoch, epochs) / double(batch)
+        loss_sum: double = double(0.0)
+        ok_sum: sizet = 0
+        samples_seen: sizet = 0
+        step: sizet = 0
+        while step * batch < n_train:
+            if prog_stop != 0:
+                break
+            # 采样与前向/反向必须融合在同一个循环里: CNN 算子是单样本的(吃
+            # in_buf), 若先把 batch 张图都"抽"进同一块缓冲再统一前向, 缓冲里
+            # 只剩最后一张图, 却会被贴上 batch 个不同标签重复前向/反向 ——
+            # 梯度就退化成"同一张图对随机标签求平均", 网络会收敛到与输入无关
+            # 的均匀输出(argmax 恒定), 且 loss/acc 随标签乱跳。
+            cnn_zero_grads(net)
+            bok: sizet = 0
+            bl: double = double(0.0)
+            for i in range(batch):
+                ridx: sizet = rand_idx(n_train)
+                src: sizet = ridx * N_IN
+                lab: int = yd[ridx]
+                if augment != 0:
+                    ady: int = rand_shift_amt()
+                    adx: int = rand_shift_amt()
+                    fill_sample(xd, src, ind, 0, ady, adx)
+                else:
+                    for j in range(N_IN):
+                        ind[j] = xd[src + j]
+                cnn_forward(net, in_buf)
+                bl = bl + cnn_backward(net, in_buf, lab)
+                if cnn_argmax(net) == lab:
+                    bok += 1
+            # 参数更新(一次)
+            cnn_sgd(net, eff_lr)
+            loss_sum = loss_sum + bl / double(batch)
+            ok_sum = ok_sum + bok
+            samples_seen += batch
+            step += 1
+            gstep += 1
+
+            bacc: double = double(bok) / double(batch)
+            if gstep == 1:
+                ema_loss = bl / double(batch)
+                ema_acc = bacc
+            else:
+                ema_loss = ema_loss * double(0.9) + (bl / double(batch)) * double(0.1)
+                ema_acc = ema_acc * double(0.9) + bacc * double(0.1)
+            if gstep % stride == 0 and prog_n < PROG_MAX:
+                px: double* = prog_x
+                pl: double* = prog_loss
+                pa: double* = prog_acc
+                px[prog_n] = double(gstep)
+                pl[prog_n] = ema_loss
+                pa[prog_n] = ema_acc * double(100.0)
+                prog_n += 1
+                prog_step = gstep
+        n_steps: sizet = step
+        avg_loss: double = double(0.0)
+        acc: double = double(0.0)
+        if n_steps > 0:
+            avg_loss = loss_sum / double(n_steps)
+            acc = double(ok_sum) / double(samples_seen) * double(100.0)
+        # 留出验证集: 每轮末逐样本测一次(CNN 是单样本算子)
+        vacc: double = double(0.0)
+        vloss: double = double(0.0)
+        if n_val > 0:
+            vok: sizet = 0
+            for vi in range(n_val):
+                for vj in range(N_IN):
+                    ind[vj] = xd[n_train * N_IN + vi * N_IN + vj]
+                cnn_forward(net, in_buf)
+                vloss = vloss + ce_from_logits(net.BLG, 0, N_OUT, yd[n_train + vi])
+                if cnn_argmax(net) == yd[n_train + vi]:
+                    vok += 1
+            vloss = vloss / double(n_val)
+            vacc = double(vok) / double(n_val) * double(100.0)
+            prog_push_val(gstep, vloss, vacc)
+        prog_epoch = int(epoch) + 1
+        prog_step = gstep
+        stdio.printf("[epoch %d] loss=%.4f  train-acc=%.2f%%  val-loss=%.4f  val-acc=%.2f%%\n",
+                     int(epoch + 1), avg_loss, acc, vloss, vacc)
+        epoch += 1
+        if prog_stop != 0:
+            break
+
+    if save_path is not None and string.strlen(save_path) > 0:
+        if save_model(net, save_path) == 0:
+            stdio.printf("[model] 已保存: %s\n", save_path)
+
+    stdlib.free(in_buf)
+    prog_done = 1
+    return 0
+
+
+def train_run(pool: memhub.MemBuddy*,
+              net: Net*,
+              xbuf: double*, ybuf: int*,
+              n_train: sizet, batch: sizet, epochs: sizet,
+              lr: double, save_path: str, augment: int) -> int:
+    """按 net.Arch 分派训练(两套实现的进度总线/停止请求口径一致)
+
+    训练数据尾部的约 1/VAL_RATIO 张留作验证集(不参与抽样, 每 epoch 末测一次);
+    为了让 MLP 走整批前向, 留出量向下取整到 batch 的整数倍。"""
+    if net is None:
+        global prog_fail, prog_done
+        prog_fail = 1
+        prog_done = 1
+        return 1
+    n_tr: sizet = n_train
+    n_val: sizet = 0
+    if batch > 0 and n_train >= batch * sizet(VAL_MIN_BATCHES):
+        n_val = (n_train / sizet(VAL_RATIO) / batch) * batch
+        n_tr = n_train - n_val
+    if net.Arch == ARCH_CNN:
+        return _train_cnn(pool, net, xbuf, ybuf, n_tr, batch, epochs,
+                          lr, save_path, augment, n_val)
+    return _train_mlp(pool, net, xbuf, ybuf, n_tr, batch, epochs,
+                      lr, save_path, augment, n_val)
+
+
+# ============================================================
+# 单样本推理(不占内存池, 供 GUI 手绘板调用)
+# ============================================================
+def predict_full(w1: torch.Tensor*, b1: torch.Tensor*,
+                 w2: torch.Tensor*, b2: torch.Tensor*,
+                 img28: bytes, hidden: sizet,
+                 out_probs: double*,
+                 out_hidden: double*) -> int:
+    """28x28 灰度(0..255) → 10 类概率(写入 out_probs) 与 hidden 激活(写入 out_hidden)。
+    返回 argmax; out_probs / out_hidden 可为 None 表示不取该输出。"""
+    if img28 is None or w1 is None or w2 is None:
+        return -1
+    h: sizet = hidden
+    xbuf: double* = stdlib.malloc(N_IN * 8)
+    pbuf: double* = stdlib.malloc(h * 8)
+    lbuf: double* = stdlib.malloc(N_OUT * 8)
+    if xbuf is None or pbuf is None or lbuf is None:
+        if xbuf is not None:
+            stdlib.free(xbuf)
+        if pbuf is not None:
+            stdlib.free(pbuf)
+        if lbuf is not None:
+            stdlib.free(lbuf)
+        return -1
+    wd1: double* = torch.tensor_data(w1)
+    bd1: double* = torch.tensor_data(b1)
+    wd2: double* = torch.tensor_data(w2)
+    bd2: double* = torch.tensor_data(b2)
+    x: double* = xbuf
+    pl: double* = pbuf
+    lgl: double* = lbuf
+    inv255: double = double(1.0) / double(255.0)
+    for j in range(N_IN):
+        x[j] = double(img28[j]) * inv255
+    # hidden = relu(W1 x + b1)
+    for k in range(h):
+        acc: double = bd1[k]
+        i: sizet = 0
+        base: sizet = k * N_IN
+        while i < N_IN:
+            acc = acc + wd1[base + i] * x[i]
+            i += 1
+        if acc > double(0.0):
+            pl[k] = acc
+        else:
+            pl[k] = double(0.0)
+    # logits = W2 h + b2
+    for ci in range(N_OUT):
+        acc2: double = bd2[ci]
+        i2: sizet = 0
+        base2: sizet = ci * h
+        while i2 < h:
+            acc2 = acc2 + wd2[base2 + i2] * pl[i2]
+            i2 += 1
+        lgl[ci] = acc2
+    # 数值稳定 softmax
+    mx: double = lgl[0]
+    for ci in range(1, N_OUT):
+        if lgl[ci] > mx:
+            mx = lgl[ci]
+    s: double = double(0.0)
+    for ci in range(N_OUT):
+        s = s + vipermath.exp(lgl[ci] - mx)
+    best: int = 0
+    bv: double = double(-1.0)
+    for ci in range(N_OUT):
+        p: double = vipermath.exp(lgl[ci] - mx) / s
+        if out_probs is not None:
+            op: double* = out_probs
+            op[ci] = p
+        if p > bv:
+            bv = p
+            best = int(ci)
+    if out_hidden is not None:
+        oh: double* = out_hidden
+        for k2 in range(h):
+            oh[k2] = pl[k2]
+    stdlib.free(xbuf)
+    stdlib.free(pbuf)
+    stdlib.free(lbuf)
+    return int(best)
+
+
+def predict_cnn(net: Net*, img28: bytes,
+                out_probs: double*,
+                out_hidden: double*) -> int:
+    """CNN 单样本推理(概率 = softmax(logits))"""
+    if net is None or img28 is None:
+        return -1
+    h: sizet = net.Hidden
+    xbuf: t.CPtr = stdlib.malloc(N_IN * 8)
+    if xbuf is None:
+        return -1
+    x: double* = xbuf
+    inv255: double = double(1.0) / double(255.0)
+    for j in range(N_IN):
+        x[j] = double(img28[j]) * inv255
+    cnn_forward(net, xbuf)
+    stdlib.free(xbuf)
+    ld: double* = net.BLG
+    # 数值稳定 softmax
+    mx: double = ld[0]
+    for ci in range(1, N_OUT):
+        if ld[ci] > mx:
+            mx = ld[ci]
+    s: double = double(0.0)
+    for ci in range(N_OUT):
+        s = s + vipermath.exp(ld[ci] - mx)
+    if s <= double(0.0):
+        return -1
+    best: int = 0
+    bv: double = double(-1.0)
+    for ci in range(N_OUT):
+        p: double = vipermath.exp(ld[ci] - mx) / s
+        if out_probs is not None:
+            op: double* = out_probs
+            op[ci] = p
+        if p > bv:
+            bv = p
+            best = int(ci)
+    if out_hidden is not None:
+        oh: double* = out_hidden
+        hd: double* = net.BA3
+        for k2 in range(h):
+            oh[k2] = hd[k2]
+    return best
+
+
+def predict_net(net: Net*, img28: bytes,
+                out_probs: double*,
+                out_hidden: double*) -> int:
+    """按架构推理单样本; 返回 argmax(-1 失败)。
+    out_hidden 是"隐藏层激活"(MLP: relu 后隐藏层; CNN: FC1 的 relu 后), 供 3D 图点亮"""
+    if net is None:
+        return -1
+    if net.Arch == ARCH_CNN:
+        return predict_cnn(net, img28, out_probs, out_hidden)
+    return predict_full(net.w1, net.b1, net.w2, net.b2, img28, net.Hidden,
+                        out_probs, out_hidden)
+
+
+def evaluate_cnn(net: Net*,
+                 xbuf: double*, ybuf: int*,
+                 n_test: sizet, show: sizet) -> double:
+    """CNN 全量评测(逐样本前向, 不累积梯度)"""
+    if net is None or n_test == 0:
+        return double(0.0)
+    xd: double* = xbuf
+    yd: int* = ybuf
+    in_buf: t.CPtr = stdlib.malloc(N_IN * 8)
+    if in_buf is None:
+        return double(0.0)
+    ind: double* = in_buf
+    ok_all: sizet = 0
+    for i in range(n_test):
+        # xbuf 已经是 0..1 归一化数据(load_mnist_images), 直接搬运即可
+        for j in range(N_IN):
+            ind[j] = xd[i * N_IN + j]
+        cnn_forward(net, in_buf)
+        pred: int = cnn_argmax(net)
+        if i < show:
+            stdio.printf("  img[%zu] 预测=%d 真实=%d %s\n",
+                         i, pred, yd[i], "OK" if pred == yd[i] else "NG")
+        if pred == yd[i]:
+            ok_all += 1
+    acc: double = double(ok_all) / double(n_test) * double(100.0)
+    stdio.printf("[eval] 正确=%zu/%zu  准确率=%.2f%%\n", ok_all, n_test, acc)
+    stdlib.free(in_buf)
+    return acc
+
+
+def evaluate_net(pool: memhub.MemBuddy*, net: Net*,
+                 xbuf: double*, ybuf: int*,
+                 n_test: sizet, batch: sizet,
+                 show: sizet) -> double:
+    """全量评测(按架构分派)"""
+    if net is None:
+        return double(0.0)
+    if net.Arch == ARCH_CNN:
+        return evaluate_cnn(net, xbuf, ybuf, n_test, show)
+    return evaluate(pool, net.w1, net.b1, net.w2, net.b2, xbuf, ybuf,
+                    n_test, batch, net.Hidden, show)
+
+
+# ============================================================
+# 3D 结构图数据
+# ============================================================
+def downsample_8x8(img28: bytes, out64: double*):
+    """28x28 灰度(0..255) → 8x8 抽稀(0..1), 写入 out64[64]"""
+    if img28 is None or out64 is None:
+        return
+    ob: double* = out64
+    for r in range(GRAPH_IN_SIDE):
+        y0: sizet = sizet(r) * 28 / GRAPH_IN_SIDE
+        y1: sizet = (sizet(r) + 1) * 28 / GRAPH_IN_SIDE
+        if y1 <= y0:
+            y1 = y0 + 1
+        for c in range(GRAPH_IN_SIDE):
+            x0: sizet = sizet(c) * 28 / GRAPH_IN_SIDE
+            x1: sizet = (sizet(c) + 1) * 28 / GRAPH_IN_SIDE
+            if x1 <= x0:
+                x1 = x0 + 1
+            acc: double = double(0.0)
+            cnt: sizet = 0
+            y: sizet = y0
+            while y < y1:
+                xx: sizet = x0
+                while xx < x1:
+                    acc = acc + double(img28[y * 28 + xx])
+                    cnt += 1
+                    xx += 1
+                y += 1
+            if cnt > 0:
+                ob[r * GRAPH_IN_SIDE + c] = acc / double(cnt) / double(255.0)
+
+
+def graph_edge_count(hidden: sizet) -> sizet:
+    """输入抽稀层→隐藏层 + 隐藏层→输出层 的边总数"""
+    return sizet(GRAPH_IN) * hidden + hidden * N_OUT
+
+
+def build_graph_edges(w1: torch.Tensor*, w2: torch.Tensor*,
+                      hidden: sizet, out_w: double*):
+    """按 Graph3D 的边顺序生成权重:
+      [0, 64*hidden)      输入抽稀(8x8) → 隐藏: W1[j][pixel] 在块内取平均
+      [64*hidden, 末尾)   隐藏 → 输出: W2[k][j]
+    总长 = graph_edge_count(hidden)"""
+    if w1 is None or w2 is None or out_w is None:
+        return
+    h: sizet = hidden
+    wd1: double* = torch.tensor_data(w1)
+    wd2: double* = torch.tensor_data(w2)
+    ow: double* = out_w
+    # 输入抽稀 → 隐藏
+    for j in range(h):
+        base: sizet = j * N_IN
+        for r in range(GRAPH_IN_SIDE):
+            y0: sizet = sizet(r) * 28 / GRAPH_IN_SIDE
+            y1: sizet = (sizet(r) + 1) * 28 / GRAPH_IN_SIDE
+            if y1 <= y0:
+                y1 = y0 + 1
+            for c in range(GRAPH_IN_SIDE):
+                x0: sizet = sizet(c) * 28 / GRAPH_IN_SIDE
+                x1: sizet = (sizet(c) + 1) * 28 / GRAPH_IN_SIDE
+                if x1 <= x0:
+                    x1 = x0 + 1
+                acc: double = double(0.0)
+                cnt: sizet = 0
+                y: sizet = y0
+                while y < y1:
+                    xx: sizet = x0
+                    while xx < x1:
+                        acc = acc + wd1[base + y * 28 + xx]
+                        cnt += 1
+                        xx += 1
+                    y += 1
+                if cnt > 0:
+                    ow[(r * GRAPH_IN_SIDE + c) * h + j] = acc / double(cnt)
+    # 隐藏 → 输出
+    off: sizet = sizet(GRAPH_IN) * h
+    for j2 in range(h):
+        for k in range(N_OUT):
+            ow[off + j2 * N_OUT + k] = wd2[k * h + j2]
+
+
+def build_graph_edges_flat(w_in: torch.Tensor*,
+                           w_out: torch.Tensor*,
+                           hidden: sizet, in_dim: sizet,
+                           out_w: double*):
+    """CNN 用的 3D 图边权重(层规模同样是 64 → hidden → 10):
+      [0, 64*hidden)      输入抽稀(8x8) → 隐藏: FC1 的 in_dim 列按 64 等分块求平均
+      [64*hidden, 末尾)   隐藏 → 输出: FC2[k][j]
+    注意: 池化后的特征图与像素坐标已无一一对应, 这里的"输入→隐藏"只是把
+    FC1 权重压到 64 个格子上做量级可视化(形状与 MLP 一致, 位置无物理意义)。"""
+    if w_in is None or w_out is None or out_w is None or in_dim == 0:
+        return
+    h: sizet = hidden
+    gi: sizet = sizet(GRAPH_IN)
+    wd1: double* = torch.tensor_data(w_in)
+    wd2: double* = torch.tensor_data(w_out)
+    ow: double* = out_w
+    for j in range(h):
+        base: sizet = j * in_dim
+        for p in range(gi):
+            i0: sizet = p * in_dim / gi
+            i1: sizet = (p + 1) * in_dim / gi
+            if i1 <= i0:
+                i1 = i0 + 1
+            acc: double = double(0.0)
+            cnt: sizet = 0
+            i: sizet = i0
+            while i < i1:
+                acc = acc + wd1[base + i]
+                cnt += 1
+                i += 1
+            if cnt > 0:
+                ow[p * h + j] = acc / double(cnt)
+    off: sizet = gi * h
+    for j2 in range(h):
+        for k in range(N_OUT):
+            ow[off + j2 * N_OUT + k] = wd2[k * h + j2]
+
+
+def graph_edges_for(net: Net*, out_w: double*):
+    """按架构生成 3D 图边权重(两种架构的层规模都是 64 → hidden → 10)"""
+    if net is None or out_w is None:
+        return
+    if net.Arch == ARCH_CNN:
+        build_graph_edges_flat(net.wf1, net.wf2, net.Hidden,
+                               cnn_fc_in(net), out_w)
+        return
+    build_graph_edges(net.w1, net.w2, net.Hidden, out_w)

@@ -1,0 +1,143 @@
+import w32.win32console as w32cmd
+import stdio
+import t, c
+from stdint import *
+from t import CInt as MyInt
+from stdint import BYTE as MyByte
+import main2
+
+pagecode: t.CDefine = 65001
+
+# 类型系统收敛测试：typedef 值引用 from-import 别名（阶段1a 别名链）
+MyWord: t.CTypedef = MyInt
+MyDword: t.CTypedef = DWORD
+
+
+class TestStruct():
+    a: t.CInt
+    b: t.CInt
+
+
+class Obj():
+    val: t.CInt
+
+
+export def main() -> int:
+    w32cmd.SetConsoleOutputCP(pagecode)
+    w32cmd.SetConsoleCP(pagecode)
+    print("=== Unary * / & (Deref/AddrOf) Test ===")
+
+    # --- Test 1: 标量 & 取地址 + * 解引用 ---
+    x: int = 42
+    px: int* = &x
+    d: int = *px
+    print(f"T1: x={x}  *(&x)={d}  (expect 42, 42)")
+    if d == 42:
+        print("T1 OK")
+    else:
+        print("T1 FAIL")
+
+    # --- Test 2: 通过指针写回（c.DerefAs 兼容形式） ---
+    #*px = 100
+
+    #k: int**
+    #l = *k
+    c.DerefAs(px, 100)
+    print(f"T2: after c.DerefAs(px, 100) x={x}  (expect 100)")
+    if x == 100:
+        print("T2 OK")
+    else:
+        print("T2 FAIL")
+
+    # --- Test 3: 数组元素地址 &arr[i] + * 解引用 ---
+    a: t.CArray[t.CInt, 4]
+    a[0] = 7
+    pa: t.CInt | t.CPtr = &a[0]
+    v3: int = *pa
+    print(f"T3: a[0]={a[0]}  *&a[0]={v3}  (expect 7, 7)")
+    if v3 == 7:
+        print("T3 OK")
+    else:
+        print("T3 FAIL")
+
+    # --- Test 4: 结构体字段地址 &s.f + * 解引用 ---
+    s: TestStruct
+    s.a = 10
+    pf: t.CInt | t.CPtr = &s.a
+    v4: int = *pf
+    print(f"T4: s.a={s.a}  *&s.a={v4}  (expect 10, 10)")
+    if v4 == 10:
+        print("T4 OK")
+    else:
+        print("T4 FAIL")
+
+    # --- Test 5: &obj 对象指针（对象变量即指针） ---
+    o: Obj
+    o.val = 99
+    po: Obj | t.CPtr = &o
+    print(f"T5: o.val={o.val}  &o->val={po.val}  (expect 99, 99)")
+    if po.val == 99:
+        print("T5 OK")
+    else:
+        print("T5 FAIL")
+
+    print("=== Unary * / & Test Done ===")
+
+    # ============================================================
+    # 类型系统收敛测试（阶段1a/1b/2/3）
+    # 验证：正常库分析优先（from-import 别名、库 typedef 动态表），
+    # t/c 库内部特判兜底（CInt/CBool/CPtr 等核心原语保留硬编码）。
+    # ============================================================
+    print("=== Type System Convergence Test ===")
+
+    # --- T6: from-import 别名反查（阶段1a）---
+    # from t import CInt as MyInt → 裸名 MyInt 注解经别名反查 → i32
+    a6: MyInt = 123
+    # MyWord: t.CTypedef = MyInt → typedef 值引用别名 → 链式解析
+    b6: MyWord = 456
+    # from stdint import BYTE as MyByte → 裸名别名 → t.CUnsignedChar
+    m6: MyByte = 65
+    print(f"T6: MyInt={a6} MyWord={b6} MyByte={m6} (expect 123, 456, 65)")
+    if a6 == 123 and b6 == 456 and m6 == 65:
+        print("T6 OK")
+    else:
+        print("T6 FAIL")
+
+    # --- T7: 库 typedef 裸名解析（阶段1b/2）---
+    # 裸名 BYTE/DWORD 走 CTypedef 动态表（stdint.vp 声明权威）
+    bb7: BYTE = 200
+    dd7: DWORD = 0x12345678
+    # typedef 引用 typedef（MyDword = DWORD → CUInt32T）
+    jj7: MyDword = 0xABCD
+    # t/c 核心原语内部特判保留（t.CBool → i1 硬编码兜底）
+    kk7: t.CBool = True
+    print(f"T7: BYTE={bb7} DWORD={dd7} MyDword={jj7} CBool={kk7} (expect 200, 305419896, 43981, 1)")
+    if bb7 == 200 and dd7 == 0x12345678 and jj7 == 0xABCD and kk7 == 1:
+        print("T7 OK")
+    else:
+        print("T7 FAIL")
+
+    # --- T8: __sizeof__ 库 typedef（阶段3 尺寸联动）---
+    s8a: int = BYTE.__sizeof__()
+    s8b: int = DWORD.__sizeof__()
+    s8c: int = MyWord.__sizeof__()
+    s8d: int = t.CBool.__sizeof__()
+    print(f"T8: sizeof(BYTE)={s8a} sizeof(DWORD)={s8b} sizeof(MyWord)={s8c} sizeof(CBool)={s8d} (expect 1, 4, 4, 1)")
+    if s8a == 1 and s8b == 4 and s8c == 4 and s8d == 1:
+        print("T8 OK")
+    else:
+        print("T8 FAIL")
+
+    # --- T9: typedef 联合（BYTE | t.CPtr → 指针包装，* 解引用）---
+    p9: BYTE | t.CPtr = &bb7
+    v9: BYTE = *p9
+    print(f"T9: *(BYTE|CPtr)={v9} (expect 200)")
+    if v9 == 200:
+        print("T9 OK")
+    else:
+        print("T9 FAIL")
+
+    print("=== Type System Convergence Test Done ===")
+
+    main2.m()
+    return 0

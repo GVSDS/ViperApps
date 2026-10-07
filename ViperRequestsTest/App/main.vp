@@ -1,0 +1,301 @@
+# main.vp — ViperRequestsTest: HTTP + HTTPS client test
+#
+# Coverage:
+#   1) requests.get            - plain-socket HTTP GET
+#   2) rhttps.get verify=True  - HTTPS with chain verification (without a CA it is expected to fail, with reason)
+#   3) rhttps.get verify=False - HTTPS channel demo (prints TLS version / cipher / peer subject)
+#   4) rhttps.post             - HTTPS POST
+#
+# Usage: requests._mbuddy = my_mbuddy (https reuses the same memory pool)
+import t, c
+from stdint import *
+import stdio
+import stdlib
+import string
+import socket
+import memhub
+import requests
+import requests.https as rhttps
+import requests.download as rd
+import zlib.pyzlib as pyzlib
+import w32.win32file as wf
+import w32.win32base as wb
+
+
+# Global MBuddy pointer
+_mbuddy: memhub.MemBuddy*
+
+
+def _PrintBody(head: str, resp: requests.Response*):
+    """Print the response status and a body snippet."""
+    if resp is None:
+        return
+    code: INT = resp.status_code
+    length: INT = resp.body_len
+    stdio.printf("%s -> status=%d, body_len=%d\n", head, code, length)
+    if resp.text is not None and length > 0:
+        show: INT = 160
+        if length < show:
+            show = length
+        txt: str = resp.text
+        i: INT = 0
+        while i < show and txt[i] != 0:
+            stdio.printf("%c", txt[i])
+            i += 1
+        stdio.printf("\n")
+
+
+def _PrintHeader(resp: requests.Response*, name: str):
+    """Demonstrate a case-insensitive response header lookup."""
+    hbuf: str = _mbuddy.alloc(128)
+    if hbuf is None:
+        return
+    if requests.header_value(resp, name, hbuf, 128) == 0:
+        stdio.printf("  [header] %s: %s\n", name, hbuf)
+    else:
+        stdio.printf("  [header] %s: (missing)\n", name)
+    _mbuddy.free(hbuf)
+
+
+@t.CExport
+def main() -> int:
+    global _mbuddy
+    stdio.printf("ViperRequestsTest: HTTP + HTTPS client test\n")
+
+    # ---- Init the memory pool (16MB arena) and hand it to the requests package ----
+    arena: bytes = stdlib.malloc(16 * 1024 * 1024)
+    if arena is None:
+        stdio.printf("FATAL: malloc arena failed\n")
+        return 1
+
+    _mbuddy = memhub.MemBuddy(arena, 16 * 1024 * 1024)
+    requests._mbuddy = _mbuddy
+
+    # ---- 1) HTTP GET ----
+    stdio.printf("\n--- 1) HTTP GET (http://example.com/) ---\n")
+    resp = requests.get("http://example.com/")
+    if resp is not None:
+        _PrintBody("requests.get", resp)
+        _PrintHeader(resp, "Content-Type")     # header lookup (case-insensitive)
+        _PrintHeader(resp, "X-Not-Exist")      # absent -> (missing)
+        requests.release(resp)
+    else:
+        stdio.printf("requests.get: FAIL (network unavailable)\n")
+
+    # ---- 2) HTTPS GET, verification ON (explicit CA bundle, chain checks out) ----
+    stdio.printf("\n--- 2) HTTPS GET verify=True (Mozilla CA bundle) ---\n")
+    resp2 = rhttps.get("https://example.com/", True, "D:/msys64/mingw64/etc/ssl/certs/ca-bundle.crt")
+    if resp2 is not None:
+        _PrintBody("https.get(verify=True)", resp2)
+        stdio.printf("  verify result = %d (0=chain ok), enabled = %d\n",
+            rhttps.last_verify_result(), rhttps.last_verify_enabled())
+        requests.release(resp2)
+    else:
+        err: str = rhttps.last_error()
+        stdio.printf("https.get(verify=True): REJECTED (cert verify failed)\n")
+        stdio.printf("  reason: %s\n", err if err is not None else "?")
+
+    # ---- 3) HTTPS GET, verification OFF (TLS channel + metadata demo) ----
+    stdio.printf("\n--- 3) HTTPS GET verify=False (TLS info) ---\n")
+    resp3 = rhttps.get("https://example.com/", False)
+    if resp3 is not None:
+        _PrintBody("https.get(verify=False)", resp3)
+        _PrintHeader(resp3, "content-type")    # https responses also expose headers (lowercase demo)
+        tls_info: str = rhttps.last_tls_info()
+        stdio.printf("  tls: %s\n", tls_info if tls_info is not None else "?")
+        requests.release(resp3)
+    else:
+        err3: str = rhttps.last_error()
+        stdio.printf("https.get(verify=False): FAIL\n")
+        stdio.printf("  reason: %s\n", err3 if err3 is not None else "?")
+
+    # ---- 4) HTTPS POST (a 405 from the peer is fine; verifies send + response parsing) ----
+    stdio.printf("\n--- 4) HTTPS POST (https://example.com/) ---\n")
+    resp4 = rhttps.post("https://example.com/", "hello=viper", "application/x-www-form-urlencoded", False)
+    if resp4 is not None:
+        _PrintBody("https.post(verify=False)", resp4)
+        requests.release(resp4)
+    else:
+        err4: str = rhttps.last_error()
+        stdio.printf("https.post: FAIL\n")
+        stdio.printf("  reason: %s\n", err4 if err4 is not None else "?")
+
+    # ---- 5) chunked decode (RFC7230 official sample, offline) ----
+    stdio.printf("\n--- 5) chunked decode (RFC7230 sample) ---\n")
+    chunked_src: str = "4\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\n\r\n"
+    clen: INT = INT(string.strlen(chunked_src))
+    out: str = _mbuddy.alloc(128)
+    if out is not None:
+        dlen: INT = requests.decode_chunked(chunked_src, clen, out, 128)
+        stdio.printf("decode_chunked(%d bytes) -> %d bytes: ", clen, dlen)
+        if dlen > 0:
+            di: INT = 0
+            while di < dlen and out[di] != 0:
+                stdio.printf("%c", out[di])
+                di += 1
+        stdio.printf("\n")
+        _mbuddy.free(out)
+    else:
+        stdio.printf("decode_chunked: alloc failed\n")
+
+    # ---- 6) redirect follow (httpbin, 3 hops) ----
+    stdio.printf("\n--- 6) redirect follow (https://httpbin.org/redirect/3) ---\n")
+    resp6 = rhttps.get("https://httpbin.org/redirect/3", False)
+    if resp6 is not None:
+        _PrintBody("https.get(redirect/3)", resp6)
+        requests.release(resp6)
+    else:
+        err6: str = rhttps.last_error()
+        stdio.printf("redirect: FAIL\n  reason: %s\n", err6 if err6 is not None else "?")
+
+    # ---- 7) gzip decode (Content-Encoding: gzip handled automatically) ----
+    stdio.printf("\n--- 7) gzip decode (https://httpbin.org/gzip) ---\n")
+    resp7 = rhttps.get("https://httpbin.org/gzip", False)
+    if resp7 is not None:
+        _PrintBody("https.get(gzip)", resp7)
+        gerr: str = requests.last_error()
+        if gerr is not None and gerr[0] != 0:
+            stdio.printf("  [gzip] %s\n", gerr)
+        tebuf: str = _mbuddy.alloc(64)
+        if tebuf is not None:
+            if requests.header_value(resp7, "Transfer-Encoding", tebuf, 64) == 0:
+                stdio.printf("  [te] %s\n", tebuf)
+            _mbuddy.free(tebuf)
+        requests.release(resp7)
+    else:
+        err7: str = rhttps.last_error()
+        stdio.printf("gzip: FAIL\n  reason: %s\n", err7 if err7 is not None else "?")
+
+    # ---- 8) cert verification block (badssl self-signed not in CA bundle -> verify=True rejects) ----
+    stdio.printf("\n--- 8) cert verify block (self-signed.badssl.com) ---\n")
+    resp8 = rhttps.get("https://self-signed.badssl.com/", True, "D:/msys64/mingw64/etc/ssl/certs/ca-bundle.crt")
+    if resp8 is not None:
+        stdio.printf("verify=True: PASS (verify result = %d, unexpected for self-signed)\n", rhttps.last_verify_result())
+        _PrintBody("  body", resp8)
+        requests.release(resp8)
+    else:
+        err8: str = rhttps.last_error()
+        stdio.printf("verify=True: REJECTED as expected (verify result = %d)\n  reason: %s\n",
+            rhttps.last_verify_result(), err8 if err8 is not None else "?")
+    resp8b = rhttps.get("https://self-signed.badssl.com/", False)
+    if resp8b is not None:
+        _PrintBody("verify=False (bypass)", resp8b)
+        requests.release(resp8b)
+    else:
+        err8b: str = rhttps.last_error()
+        stdio.printf("verify=False: FAIL\n  reason: %s\n", err8b if err8b is not None else "?")
+
+    # ---- 5b) pyzlib gzip round-trip (pool=None / stdlib path) ----
+    stdio.printf("\n--- 5b) pyzlib gzip round-trip (pool=None) ---\n")
+    gsrc: str = "The quick brown fox jumps over the lazy dog while the morning sun rises slowly above the quiet hills of the eastern valley. A gentle breeze carries the fresh scent of pine trees across the winding path. Birds gather on the wooden fence and sing their cheerful songs. Farmers prepare their fields for another day of honest work. Children laugh and play near the old stone bridge. Every small village tells its own story through the eyes of its people, their traditions, and the memories shared around warm evening fires under a sky full of stars that have watched over this land for centuries. The river continues its endless journey toward the distant sea, carrying with it the hopes and dreams of all who live along its banks."
+    glen: sizet = sizet(string.strlen(gsrc))
+    clen2: sizet = 0
+    gz1: BYTEPTR = pyzlib.compress(None, BYTEPTR(gsrc), glen, 6, 31, &clen2)
+    if gz1 is not None:
+        stdio.printf("compress ok -> %zu bytes gzip\n", clen2)
+        olen2: sizet = 0
+        gz2: BYTEPTR = pyzlib.decompress(None, gz1, clen2, 15, 4096, &olen2)
+        if gz2 is not None:
+            g2s: str = char(uint64(gz2), t.CPtr)
+            g2s[olen2] = 0
+            stdio.printf("decompress ok -> %zu bytes: %s\n", olen2, g2s)
+            stdlib.free(gz1)
+            stdlib.free(gz2)
+        else:
+            stdio.printf("decompress FAIL: %s\n", pyzlib.get_error())
+    else:
+        stdio.printf("compress FAIL: %s\n", pyzlib.get_error())
+
+    # ---- 6) Large-file chunked download (httpbin 1MB: serial + parallel, byte-by-byte compare) ----
+    stdio.printf("\n--- 6) Large-file chunked download (https://httpbin.org/bytes/1048576) ---\n")
+    DL_URL: str = "https://httpbin.org/bytes/1048576"
+    CA_BUNDLE: str = "D:/msys64/mingw64/etc/ssl/certs/ca-bundle.crt"
+
+    rc6a: INT = rd.download(DL_URL, "dl_serial.bin", 1, 262144, True, CA_BUNDLE)
+    stdio.printf("6a serial  download rc=%d  last_error=%s\n", rc6a, rd.last_error())
+    rc6b: INT = rd.download(DL_URL, "dl_parallel.bin", 4, 262144, True, CA_BUNDLE)
+    stdio.printf("6b parallel(4) download rc=%d  last_error=%s\n", rc6b, rd.last_error())
+
+    # Both files must have the same size and equal 1048576
+    exp_size: LONGLONG = 1048576
+    ok6: INT = 1
+    i6: INT = 0
+    paths6: t.CArray[str, None] = ["dl_serial.bin", "dl_parallel.bin"]
+    sizes6: t.CArray[LONGLONG, None] = [0, 0]
+    for i6 in range(2):
+        h6: wb.HANDLE = wf.CreateFileA(
+            paths6[i6], wf.GENERIC_READ, wf.FILE_SHARE_READ, None,
+            wf.OPEN_EXISTING, wf.FILE_ATTRIBUTE_NORMAL, None)
+        if h6 == wb.INVALID_HANDLE_VALUE:
+            stdio.printf("6 check: open %s failed\n", paths6[i6])
+            ok6 = 0
+            continue
+        li6: wb.LARGE_INTEGER = wb.LARGE_INTEGER()
+        if wf.GetFileSizeEx(h6, &li6) == 0:
+            stdio.printf("6 check: GetFileSizeEx %s failed\n", paths6[i6])
+            ok6 = 0
+        else:
+            sizes6[i6] = li6.QuadPart
+            stdio.printf("6 check: %s size=%lld\n", paths6[i6], li6.QuadPart)
+        wb.CloseHandle(h6)
+    if ok6 != 0 and sizes6[0] == exp_size and sizes6[1] == exp_size:
+        # Byte-by-byte content comparison
+        same6: INT = 1
+        a6: str = stdlib.malloc(65536)
+        b6: str = stdlib.malloc(65536)
+        if a6 is None or b6 is None:
+            stdio.printf("6 compare: out of memory\n")
+        else:
+            ha6: wb.HANDLE = wf.CreateFileA(
+                paths6[0], wf.GENERIC_READ, wf.FILE_SHARE_READ, None,
+                wf.OPEN_EXISTING, wf.FILE_ATTRIBUTE_NORMAL, None)
+            hb6: wb.HANDLE = wf.CreateFileA(
+                paths6[1], wf.GENERIC_READ, wf.FILE_SHARE_READ, None,
+                wf.OPEN_EXISTING, wf.FILE_ATTRIBUTE_NORMAL, None)
+            if ha6 == wb.INVALID_HANDLE_VALUE or hb6 == wb.INVALID_HANDLE_VALUE:
+                stdio.printf("6 compare: open failed\n")
+            else:
+                off6: LONGLONG = 0
+                while off6 < exp_size:
+                    ra: ULONG = 0
+                    rb: ULONG = 0
+                    chunk6: ULONG = 65536
+                    rem6: LONGLONG = exp_size - off6
+                    if rem6 < LONGLONG(65536):
+                        chunk6 = ULONG(rem6)
+                    wf.ReadFile(ha6, a6, chunk6, &ra, None)
+                    wf.ReadFile(hb6, b6, chunk6, &rb, None)
+                    if ra != chunk6 or rb != chunk6:
+                        stdio.printf("6 compare: short read at %lld\n", off6)
+                        same6 = 0
+                        break
+                    for k6 in range(chunk6):
+                        if a6[k6] != b6[k6]:
+                            stdio.printf("6 compare: MISMATCH at %lld\n", off6 + LONGLONG(k6))
+                            same6 = 0
+                            break
+                    if same6 == 0:
+                        break
+                    off6 += LONGLONG(chunk6)
+                stdio.printf("6 compare: serial == parallel(4)  %s\n",
+                             "YES" if same6 != 0 else "NO")
+            if ha6 != wb.INVALID_HANDLE_VALUE:
+                wb.CloseHandle(ha6)
+            if hb6 != wb.INVALID_HANDLE_VALUE:
+                wb.CloseHandle(hb6)
+        if a6 is not None:
+            stdlib.free(a6)
+        if b6 is not None:
+            stdlib.free(b6)
+    else:
+        stdio.printf("6 compare: size mismatch or download failed (rc6a=%d rc6b=%d)\n", rc6a, rc6b)
+
+    # Remove the downloaded files
+    wf.DeleteFileA("dl_serial.bin")
+    wf.DeleteFileA("dl_parallel.bin")
+
+    # ---- Cleanup ----
+    socket.SocketCleanup()
+    stdio.printf("\nViperRequestsTest: DONE\n")
+    return 0
+

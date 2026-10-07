@@ -1,0 +1,44 @@
+{
+    "name": "ViperOpenSSLProject - OpenSSL 3.x FFI Test",
+    "version": "1.0.0",
+    "source_dir": "./App",
+    "build_dir": "./.tpv_build",
+    "compiler": {
+        "cmd": "llc",
+        "flags": [
+            "-filetype=obj",
+            "-relocation-model=pic"
+        ]
+    },
+    "linker": {
+        "cmd": "D:/msys64/mingw64/bin/clang++.exe",
+        "flags": [
+            "-fuse-ld=lld",
+            "-lws2_32",
+            "-lcrypt32",
+            "-ladvapi32",
+            "-lmsvcrt",
+            "-lmingwex",
+            "-lgdi32",
+            "-lpthread",
+            "-lkernel32"
+        ],
+        "static_libs": [
+            "../../dlls/lib/libssl.a",
+            "../../dlls/lib/libcrypto.a"
+        ],
+        "output": "app.exe"
+    },
+    "includes": [
+        "../../includes"
+    ],
+    "target": {
+        "triple": "x86_64-pc-windows-gnu",
+        "datalayout": "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+    },
+    "options": {
+        "slice_level": 3,
+        "target": "llvm",
+        "strict_mode": true
+    }
+}

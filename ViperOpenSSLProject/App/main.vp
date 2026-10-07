@@ -1,0 +1,46 @@
+# main.vp — ViperOpenSSLProject：版本 + 摘要演示
+#
+# 使用 includes/openssl FFI 层（import openssl）：
+#   1) 打印 OpenSSL 版本号
+#   2) 计算 "hello openssl" 的 MD5 / SHA256 十六进制摘要
+#
+# 链接目标尚未定（msys2 预装 3.6.2 动态库 或 openssl_358_C 自编译），
+# 配好 project.vpj 的 -lcrypto/-lssl（或 static_libs）后才可链接运行。
+import t, c
+import stdlib
+import binascii
+import openssl
+import w32.win32console as w32cmd
+import viperlib
+
+
+def print_digest(name: str, buf: bytes, length: int):
+    hex_str: str = binascii.hexlify(buf, length)
+    print(f"{name}: {hex_str}")
+
+
+def main() -> int:
+    w32cmd.SetConsoleOutputCP(65001)
+    w32cmd.SetConsoleCP(65001)
+
+    # ---- 1) 版本 ----
+    ver: str = openssl.OpenSSL_version(openssl.OpenSslVersion)
+    print("OpenSSL version:", ver)
+    num: uint32 = openssl.OpenSSL_version_num()
+    print(f"Version number : 0x{num:x}")
+
+    # ---- 2) 摘要 ----
+    data: str = "hello openssl"
+    dlen: int = len(data)
+
+    md5_buf: bytes = stdlib.malloc(openssl.Md5DigestLength)
+    openssl.MD5(data, dlen, md5_buf)
+    print_digest("MD5  ", md5_buf, openssl.Md5DigestLength)
+    stdlib.free(md5_buf)
+
+    sha256_buf: bytes = stdlib.malloc(openssl.Sha256DigestLength)
+    openssl.SHA256(data, dlen, sha256_buf)
+    print_digest("SHA256", sha256_buf, openssl.Sha256DigestLength)
+    stdlib.free(sha256_buf)
+
+    return 0

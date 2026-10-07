@@ -1,0 +1,472 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# MnistData - MNIST IDX 数据层（CLI 与 Qt 面板共用）
+#
+# 职责:
+#   * 标准文件名拼装与完整性预检(idx_usable)
+#   * .gz 解压写入 IDX: 本地文件(inflate_local) / 联网(download_inflate)
+#   * 就绪保障 ensure_mnist(缺或坏 → 本地 --file 优先, 其次联网)
+#   * IDX → 训练/测试缓冲(load_mnist_images / load_mnist_labels)
+#
+# 说明: fileio.File.read_all 契约是"最多读 max_count-1 字节并补 NUL",
+#   故所有整读调用都按 目标长度+1 申请与请求, 否则会丢最后一字节。
+# ============================================================
+import t, c
+from stdint import *
+import stdlib
+import string
+import stdio
+import viperlib
+import os
+import w32.fileio as fileio
+import gzip
+import requests
+import requests.https as reqhttps
+
+# 28x28 灰度输入 / 10 类输出
+N_IN: sizet = 784
+N_OUT: sizet = 10
+
+# MNIST 官方镜像(ossci S3)
+MNIST_BASE: str = "https://ossci-datasets.s3.amazonaws.com/mnist"
+
+
+# ============================================================
+# 基础读写
+# ============================================================
+def be32(buf: t.CPtr, off: sizet) -> uint32:
+    """IDX 大端 u32"""
+    ub: uchar* = buf
+    return (uint32(ub[off]) << 24) | (uint32(ub[off + 1]) << 16) \
+        | (uint32(ub[off + 2]) << 8) | uint32(ub[off + 3])
+
+
+def read_file_all(path: str, fsize: sizet) -> t.CPtr:
+    """整读文件到 malloc 缓冲, 失败返回 None
+    注意: read_all 最多读 max_count-1 字节并补 NUL, 故按 fsize+1 申请/请求"""
+    f: fileio.File* = fileio.File(path, fileio.MODE.R)
+    if f.closed:
+        return None
+    buf: t.CPtr = stdlib.malloc(fsize + 1)
+    if buf is None:
+        f.close()
+        return None
+    got: LONG = f.read_all(buf, ULONG(fsize + 1))
+    f.close()
+    if got <= 0 or sizet(got) != fsize:
+        stdlib.free(buf)
+        return None
+    return buf
+
+
+def file_exists(path: str) -> int:
+    f: fileio.File* = fileio.File(path, fileio.MODE.R)
+    if f.closed:
+        return 0
+    f.close()
+    return 1
+
+
+def atof(s: str, dflt: double) -> double:
+    """简易字符串 → double(支持整数部分/小数部分)"""
+    if s is None:
+        return dflt
+    val: double = double(0.0)
+    i: sizet = 0
+    neg: int = 0
+    if s[i] == 45:      # '-'
+        neg = 1
+        i += 1
+    while s[i] >= 48 and s[i] <= 57:
+        val = val * double(10.0) + double(s[i] - 48)
+        i += 1
+    if s[i] == 46:      # '.'
+        i += 1
+        div: double = double(10.0)
+        while s[i] >= 48 and s[i] <= 57:
+            val = val + double(s[i] - 48) / div
+            div = div * double(10.0)
+            i += 1
+    if neg != 0:
+        val = -val
+    return val
+
+
+def idx_usable(path: str, is_lb: int) -> int:
+    """IDX 完整性预检: 魔数 + 维度 + 声明张数与文件尺寸吻合(残缺/仍是 .gz 都判坏)。
+    is_lb: 1=标签 0=图像。1=可用"""
+    f: fileio.File* = fileio.File(path, fileio.MODE.R)
+    if f.closed:
+        return 0
+    sz: LONGLONG = f.size()
+    if sz < 16:
+        f.close()
+        return 0
+    hdr: t.CPtr = stdlib.malloc(64)
+    if hdr is None:
+        f.close()
+        return 0
+    # read_all 最多读 count-1 字节: 取 17 才能拿到 16 字节头部
+    got: LONG = f.read_all(hdr, ULONG(17))
+    f.close()
+    if got < 16:
+        stdlib.free(hdr)
+        return 0
+    hb: uchar* = hdr
+    if hb[0] != 0 or hb[1] != 0 or hb[2] != 8:
+        stdlib.free(hdr)
+        return 0
+    ok: int = 0
+    if is_lb == 0:
+        if hb[3] == 3:
+            n_img: sizet = sizet(be32(hdr, 4))
+            rows: sizet = sizet(be32(hdr, 8))
+            cols: sizet = sizet(be32(hdr, 12))
+            if rows == 28 and cols == 28 and 16 + n_img * N_IN <= sizet(sz):
+                ok = 1
+    else:
+        if hb[3] == 1:
+            n_lb: sizet = sizet(be32(hdr, 4))
+            if 8 + n_lb <= sizet(sz):
+                ok = 1
+    stdlib.free(hdr)
+    return ok
+
+
+# ============================================================
+# .gz → IDX
+# ============================================================
+def download_inflate(url: str, out_path: str) -> int:
+    """下载 .gz → 内存解压 → 写原始 IDX 文件。0=成功"""
+    stdio.printf("[download] %s\n", url)
+    # Windows 无系统 CA 路径, 证书链校验必然失败; MNIST 公开数据集, 关闭校验
+    r: requests.Response* = reqhttps.get(url, False)
+    if r is None:
+        stdio.printf("[download] 请求失败: %s\n", reqhttps.last_error())
+        return 1
+    if r.status_code != 200:
+        stdio.printf("[download] HTTP %d\n", r.status_code)
+        requests.release(r)
+        return 1
+    src: str = r.text
+    slen: sizet = sizet(r.body_len)
+    if src is None or slen < 18:
+        stdio.printf("[download] 响应体异常\n")
+        requests.release(r)
+        return 1
+    want: sizet = sizet(gzip.gzip_isize(src, slen))
+    cap: sizet = want
+    if cap == 0:
+        cap = slen * 16
+    if cap < 1024:
+        cap = 1024
+    # 保险起见: ISIZE 与实际不符时报"目标缓冲不足", 就翻倍重试(正常情况下一次成功)
+    dst: t.CPtr = None
+    n: LONG = 0
+    while True:
+        dst = stdlib.malloc(cap)
+        if dst is None:
+            requests.release(r)
+            return 1
+        n = gzip.gzip_decode_bytes(src, slen, dst, cap)
+        if n == -9 or n == -18 or n == -23:
+            stdlib.free(dst)
+            dst = None
+            if cap >= 1073741824:
+                break
+            cap = cap * 2
+            continue
+        break
+    requests.release(r)
+    if n <= 0:
+        stdio.printf("[download] gzip 解压失败(err=%ld)\n", n)
+        if dst is not None:
+            stdlib.free(dst)
+        return 1
+    f: fileio.File* = fileio.File(out_path, fileio.MODE.W)
+    if f.closed:
+        stdio.printf("[download] 无法写入: %s\n", out_path)
+        stdlib.free(dst)
+        return 1
+    f.write(dst, ULONG(n))
+    f.close()
+    stdlib.free(dst)
+    stdio.printf("[download] 已写入 %s (%zu 字节)\n", out_path, sizet(n))
+    return 0
+
+
+def inflate_local(gz_path: str, out_path: str) -> int:
+    """本地已下载的 .gz → 解压写入 out_path(GzipFile OOP 范式)。0=成功"""
+    stdio.printf("[gzip] 本地解压: %s\n", gz_path)
+    gz: gzip.GzipFile* = gzip.GzipFile(gz_path)
+    if gz is None or gzip.gzip_ok(gz) == 0:
+        stdio.printf("[gzip] 打开失败(err=%d): %s\n", gzip.gzip_err(gz), gz_path)
+        return 1
+    buf: BYTEPTR = gzip.gzip_read(gz)
+    n: sizet = gzip.gzip_dst_len(gz)
+    if buf is None or n == 0:
+        stdio.printf("[gzip] 解压失败(err=%d): %s\n", gzip.gzip_err(gz), gz_path)
+        gzip.gzip_close(gz)
+        return 1
+    f: fileio.File* = fileio.File(out_path, fileio.MODE.W)
+    if f.closed:
+        stdio.printf("[gzip] 无法写入: %s\n", out_path)
+        gzip.gzip_close(gz)
+        return 1
+    f.write(buf, ULONG(n))
+    f.close()
+    gzip.gzip_close(gz)
+    stdio.printf("[gzip] 已写入 %s (%zu 字节)\n", out_path, n)
+    return 0
+
+
+def ensure_mnist(data_dir: str, use_test: int, do_dl: int,
+                 loc_im: str, loc_lb: str) -> int:
+    """确保两组 IDX 存在。优先用本地 .gz(--file) 解压, 其次联网下载。0=就绪"""
+    os.mkdir(data_dir)   # 不存在则创建(已存在/失败返回 -1, 可忽略)
+    p_im: str = stdlib.malloc(1024)
+    p_lb: str = stdlib.malloc(1024)
+    url_im: str = stdlib.malloc(1024)
+    url_lb: str = stdlib.malloc(1024)
+    if use_test == 0:
+        viperlib.snprintf(p_im, 1024, "%s/train-images-idx3-ubyte", data_dir)
+        viperlib.snprintf(p_lb, 1024, "%s/train-labels-idx1-ubyte", data_dir)
+        viperlib.snprintf(url_im, 1024, "%s/train-images-idx3-ubyte.gz", MNIST_BASE)
+        viperlib.snprintf(url_lb, 1024, "%s/train-labels-idx1-ubyte.gz", MNIST_BASE)
+    else:
+        viperlib.snprintf(p_im, 1024, "%s/t10k-images-idx3-ubyte", data_dir)
+        viperlib.snprintf(p_lb, 1024, "%s/t10k-labels-idx1-ubyte", data_dir)
+        viperlib.snprintf(url_im, 1024, "%s/t10k-images-idx3-ubyte.gz", MNIST_BASE)
+        viperlib.snprintf(url_lb, 1024, "%s/t10k-labels-idx1-ubyte.gz", MNIST_BASE)
+    # 图像: 目标缺失/损坏 → 优先本地 loc_im, 其次 --download 联网
+    # 指定了本地文件就以本地为准: 读不到/解压失败直接报错, 绝不偷偷转联网
+    if idx_usable(p_im, 0) == 0:
+        if loc_im is not None:
+            if file_exists(loc_im) == 0:
+                stdio.printf("[data] 本地图像文件不存在: %s\n", loc_im)
+                return 1
+            if inflate_local(loc_im, p_im) != 0:
+                return 1
+        elif do_dl != 0:
+            if download_inflate(url_im, p_im) != 0:
+                return 1
+        else:
+            return 1
+    # 标签: 同理
+    if idx_usable(p_lb, 1) == 0:
+        if loc_lb is not None:
+            if file_exists(loc_lb) == 0:
+                stdio.printf("[data] 本地标签文件不存在: %s\n", loc_lb)
+                return 1
+            if inflate_local(loc_lb, p_lb) != 0:
+                return 1
+        elif do_dl != 0:
+            if download_inflate(url_lb, p_lb) != 0:
+                return 1
+        else:
+            return 1
+    return 0
+
+
+# 缺失位掩码: 1=训练图像 2=训练标签 4=测试图像 8=测试标签
+define MISS_TRAIN_IM = 1
+define MISS_TRAIN_LB = 2
+define MISS_TEST_IM = 4
+define MISS_TEST_LB = 8
+
+
+def data_missing_mask(data_dir: str) -> int:
+    """检测 4 个 IDX 的完整性, 返回缺失位掩码(0=全部就绪)"""
+    os.mkdir(data_dir)   # 不存在则创建(已存在/失败返回 -1, 可忽略)
+    p_im: str = stdlib.malloc(1024)
+    p_lb: str = stdlib.malloc(1024)
+    if p_im is None or p_lb is None:
+        return MISS_TRAIN_IM | MISS_TRAIN_LB | MISS_TEST_IM | MISS_TEST_LB
+    m: int = 0
+    idx_paths(data_dir, 0, p_im, p_lb)
+    if idx_usable(p_im, 0) == 0:
+        m = m | MISS_TRAIN_IM
+    if idx_usable(p_lb, 1) == 0:
+        m = m | MISS_TRAIN_LB
+    idx_paths(data_dir, 1, p_im, p_lb)
+    if idx_usable(p_im, 0) == 0:
+        m = m | MISS_TEST_IM
+    if idx_usable(p_lb, 1) == 0:
+        m = m | MISS_TEST_LB
+    stdlib.free(p_im)
+    stdlib.free(p_lb)
+    return m
+
+
+def ensure_pair(data_dir: str, use_test: int, gz_img: str, gz_lb: str) -> int:
+    """用本地一对 .gz(图像 idx3 + 标签 idx1) 补齐指定集合(train/test)的缺失项。
+    0=已就绪; 1=失败(缺哪个文件会打印说明)。已就绪的那一半不动。"""
+    if gz_img is None or gz_lb is None:
+        stdio.printf("[data] 需要同时提供 图像(idx3) 与 标签(idx1) 两个 .gz\n")
+        return 1
+    p_im: str = stdlib.malloc(1024)
+    p_lb: str = stdlib.malloc(1024)
+    if p_im is None or p_lb is None:
+        return 1
+    idx_paths(data_dir, use_test, p_im, p_lb)
+    rc: int = 0
+    if idx_usable(p_im, 0) == 0:
+        if file_exists(gz_img) == 0:
+            stdio.printf("[data] 图像 .gz 不存在: %s\n", gz_img)
+            rc = 1
+        elif inflate_local(gz_img, p_im) != 0:
+            rc = 1
+    if rc == 0:
+        if idx_usable(p_lb, 1) == 0:
+            if file_exists(gz_lb) == 0:
+                stdio.printf("[data] 标签 .gz 不存在: %s\n", gz_lb)
+                rc = 1
+            elif inflate_local(gz_lb, p_lb) != 0:
+                rc = 1
+    stdlib.free(p_im)
+    stdlib.free(p_lb)
+    return rc
+
+
+def miss_mark(flag: int) -> str:
+    if flag != 0:
+        return "缺"
+    return "OK"
+
+
+def missing_text(mask: int, out: str, cap: sizet):
+    """把缺失掩码写成可读文本(供界面显示/日志)"""
+    if out is None:
+        return
+    train_im: int = 0
+    if (mask & MISS_TRAIN_IM) != 0:
+        train_im = 1
+    train_lb: int = 0
+    if (mask & MISS_TRAIN_LB) != 0:
+        train_lb = 1
+    test_im: int = 0
+    if (mask & MISS_TEST_IM) != 0:
+        test_im = 1
+    test_lb: int = 0
+    if (mask & MISS_TEST_LB) != 0:
+        test_lb = 1
+    if mask == 0:
+        viperlib.snprintf(out, cap, "全部就绪 (训练集 + 测试集)")
+        return
+    viperlib.snprintf(out, cap,
+        "缺失: 训练集 图像%s 标签%s | 测试集 图像%s 标签%s",
+        miss_mark(train_im), miss_mark(train_lb),
+        miss_mark(test_im), miss_mark(test_lb))
+
+
+# ============================================================
+# IDX → 内存缓冲
+# ============================================================
+def load_mnist_images(path: str, dst: double*,
+                      max_n: sizet) -> sizet:
+    """读 IDX 图像, 归一化写 dst[i*784+j] = pixel/255; 返回实际张数"""
+    f: fileio.File* = fileio.File(path, fileio.MODE.R)
+    if f.closed:
+        stdio.printf("[mnist] 无法打开图像文件: %s\n", path)
+        return 0
+    sz: LONGLONG = f.size()
+    if sz <= 16:
+        stdio.printf("[mnist] 图像文件过小: %s\n", path)
+        f.close()
+        return 0
+    f.close()
+    whole: t.CPtr = read_file_all(path, sizet(sz))
+    if whole is None:
+        stdio.printf("[mnist] 读取失败: %s\n", path)
+        return 0
+    # IDX 图像魔数: 00 00 08 03(压缩 .gz 以 1F 8B 开头, 会在此被识别)
+    wu: uchar* = whole
+    if wu[0] != 0 or wu[1] != 0 or wu[2] != 8 or wu[3] != 3:
+        stdio.printf("[mnist] 图像文件头非法(可能仍是 .gz 压缩数据, 请先解压): %s\n", path)
+        stdlib.free(whole)
+        return 0
+    n_total: sizet = sizet(be32(whole, 4))
+    rows: sizet = sizet(be32(whole, 8))
+    cols: sizet = sizet(be32(whole, 12))
+    if rows != 28 or cols != 28:
+        stdio.printf("[mnist] 非 28x28: %dx%d\n", int(rows), int(cols))
+        stdlib.free(whole)
+        return 0
+    use_n: sizet = n_total
+    if max_n != 0 and max_n < use_n:
+        use_n = max_n
+    if 16 + use_n * N_IN > sizet(sz):
+        stdio.printf("[mnist] 图像数据不足: 头部声明=%zu, 文件最多可容纳=%zu (%s)\n",
+                     n_total, (sizet(sz) - 16) / N_IN, path)
+        stdlib.free(whole)
+        return 0
+    ub: uchar* = whole
+    d: double* = dst
+    inv255: double = double(1.0) / double(255.0)
+    for i in range(use_n):
+        for j in range(N_IN):
+            d[i * N_IN + j] = double(ub[16 + i * N_IN + j]) * inv255
+    stdlib.free(whole)
+    return use_n
+
+
+def load_mnist_labels(path: str, dst: int*,
+                      max_n: sizet) -> sizet:
+    """读 IDX 标签到 dst(每元素 1 字节), 返回实际张数"""
+    f: fileio.File* = fileio.File(path, fileio.MODE.R)
+    if f.closed:
+        stdio.printf("[mnist] 无法打开标签文件: %s\n", path)
+        return 0
+    sz: LONGLONG = f.size()
+    if sz <= 8:
+        stdio.printf("[mnist] 标签文件过小: %s\n", path)
+        f.close()
+        return 0
+    f.close()
+    whole: t.CPtr = read_file_all(path, sizet(sz))
+    if whole is None:
+        return 0
+    # IDX 标签魔数: 00 00 08 01
+    wu2: uchar* = whole
+    if wu2[0] != 0 or wu2[1] != 0 or wu2[2] != 8 or wu2[3] != 1:
+        stdio.printf("[mnist] 标签文件头非法(可能仍是 .gz 压缩数据, 请先解压): %s\n", path)
+        stdlib.free(whole)
+        return 0
+    n_total: sizet = sizet(be32(whole, 4))
+    use_n: sizet = n_total
+    if max_n != 0 and max_n < use_n:
+        use_n = max_n
+    if 8 + use_n > sizet(sz):
+        stdio.printf("[mnist] 标签数据不足: 头部声明=%zu, 文件最多可容纳=%zu (%s)\n",
+                     n_total, sizet(sz) - 8, path)
+        stdlib.free(whole)
+        return 0
+    ub: uchar* = whole
+    lb: int* = dst
+    for i in range(use_n):
+        lb[i] = int(ub[8 + i])
+    stdlib.free(whole)
+    return use_n
+
+
+# ============================================================
+# 路径拼装(窗口/命令行共用)
+# ============================================================
+def idx_paths(data_dir: str, use_test: int, out_img: str, out_lbl: str):
+    """把 IDX 明文路径写入调用方给的 1024 字节缓冲"""
+    if use_test == 0:
+        viperlib.snprintf(out_img, 1024, "%s/train-images-idx3-ubyte", data_dir)
+        viperlib.snprintf(out_lbl, 1024, "%s/train-labels-idx1-ubyte", data_dir)
+    else:
+        viperlib.snprintf(out_img, 1024, "%s/t10k-images-idx3-ubyte", data_dir)
+        viperlib.snprintf(out_lbl, 1024, "%s/t10k-labels-idx1-ubyte", data_dir)
+
+
+def gz_urls(use_test: int, out_img: str, out_lbl: str):
+    """把 .gz 下载 URL 写入调用方给的 1024 字节缓冲"""
+    if use_test == 0:
+        viperlib.snprintf(out_img, 1024, "%s/train-images-idx3-ubyte.gz", MNIST_BASE)
+        viperlib.snprintf(out_lbl, 1024, "%s/train-labels-idx1-ubyte.gz", MNIST_BASE)
+    else:
+        viperlib.snprintf(out_img, 1024, "%s/t10k-images-idx3-ubyte.gz", MNIST_BASE)
+        viperlib.snprintf(out_lbl, 1024, "%s/t10k-labels-idx1-ubyte.gz", MNIST_BASE)

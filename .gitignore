@@ -1,0 +1,35 @@
+# ViperOS 另行开专题，不入本仓库（其自身忽略规则见 ViperOS/.gitignore）
+ViperOS/
+
+# 编译产物
+**/.tpv_build/
+**/.native_build/
+**/output/
+**/output_mlir/
+**/temp/
+**/temp_mlir/
+*.o
+*.obj
+*.exe
+*.dll
+*.dll.a
+*.lib
+*.a
+*.so
+*.elf
+*.ll
+*.img
+*.iso
+*.fd
+*.log
+
+# 数据集（MNIST 二进制，约 46MB，运行前另行准备）
+ViperMNIST/data/
+
+# Python / IDE / 缓存
+**/__pycache__/
+*.py[cod]
+.cache/
+.vscode/
+.idea/
+.trae/

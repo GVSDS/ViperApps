@@ -1,0 +1,212 @@
+# ============================================================
+# main.vp — ViperCPW：CreateProcessA 独立复现工程
+#
+# 目的：把原先塞在 TransPyV\App\main.vp 里的 [TEMP-PROBE] 探针整体搬到
+#       一个独立 Viper 工程里，脱开 TPV 单独复现 / 二分。
+#
+# 待复现现象：自举出的 TransPyV.exe 内 CreateProcessA 恒返回 0 且
+#   GetLastError=87（ERROR_INVALID_PARAMETER）；同参数在 Python/ctypes
+#   下 ok=1。
+#
+# TPV 侧已逐项实测 ok=0/err=87 的维度（本工程用于在"非 TPV 宿主"上复核）：
+#   IR/机器码栈传参（逐槽核对正确）、si.cb=104 与结构体布局、命令行内容
+#   （逐字节回读正确、手工复制不用 strcpy 也 87）、应用名（含绝对路径）、
+#   lpCurrentDirectory、lpEnvironment、bInheritHandles(0/1)、
+#   dwCreationFlags(0/CREATE_NO_WINDOW)。
+#
+# 本工程要回答的问题：这是"仅 TPV.exe 特有"，还是"任何 Viper 程序都如此"。
+#
+# 五组用例（与 TPV 探针同参数、同 si 构造），每组打印 ok 与 GetLastError：
+#   #1 lpApplicationName=NULL + "llc --version"，inh=1，flags=0
+#   #2 同 #1 但 inh=0
+#   #3 同 #1 但 flags=CREATE_NO_WINDOW
+#   #4 lpApplicationName="D:\msys64\clang64\bin\llc.exe"（绝对路径）
+#   #5 lpApplicationName=NULL + 报错里那条原样命令行（正斜杠相对路径）
+# 对照组：打印本进程 GetCurrentDirectoryA 的结果（证明本进程能正常调 Win32）。
+#
+# 判定：
+#   五组全 ok=0/err=87 ⇒ 与 TransPyV.exe 同因，问题在 Viper 生成代码/运行期，
+#                        与 TPV 自身逻辑无关（任何 Viper 程序都如此）。
+#   任一组 ok=1        ⇒ 该维度即是 TPV 特有问题，按组二分定位。
+# ============================================================
+import t, c
+from stdint import *
+import stdio
+import stdlib
+import string
+import w32.win32base
+import w32.win32file
+import w32.win32process
+import w32.win32console
+
+
+# 控制台代码页：UTF-8
+# 先例：ViperApps/ViperQtHelloWorld/App/main.vp:21（pagecode: t.CDefine = 65001）
+define PAGE_CODE = 65001
+
+
+# ============================================================
+# 单组复现：构造 si/pi → 调 CreateProcessA → 打印 ok / GetLastError / si 字段
+# si 构造与 TPV 的 _run_cmd_wait 逐字一致：
+#   T() 构造 → string.memset 显式清零 → si.cb = STARTUPINFOA.__sizeof__()
+# ============================================================
+def ProbeCreateProcessA(Tag: str, AppName: str, CommandLine: str,
+                        InheritHandles: int, CreationFlags: ULONG) -> int:
+    """[CPW] 单组 CreateProcessA：打印 ok / GetLastError / si 关键字段与地址
+
+    Tag            : 分组标签
+    AppName        : lpApplicationName（None = NULL，走 PATH 解析）
+    CommandLine    : lpCommandLine
+    InheritHandles : 第 5 实参 bInheritHandles
+    CreationFlags  : 第 6 实参 dwCreationFlags
+    lpEnvironment / lpCurrentDirectory 恒传 NULL（TPV 侧已实测与 87 无关）。
+    """
+    # 命令行必须放进可写堆缓冲：CreateProcessA 会原地改写 lpCommandLine，
+    # 不能传只读字面量。
+    # 先例：ViperApps/ViperZipfileProject/App/main.vp:64+69
+    #       （stdlib.malloc → string.strcpy）；
+    #       includes/subprocess.vp:66-75（alloc + 逐字节填入 + 结尾 0）
+    # string.strlen 声明：includes/string.vp:69；string.strcpy 声明：includes/string.vp:7
+    # stdlib.malloc 声明：includes/stdlib.vp:5
+    CmdLength: sizet = string.strlen(CommandLine)
+    CmdBuffer: bytes = stdlib.malloc(CmdLength + 1)
+    if CmdBuffer is None:
+        stdio.printf("[CPW] %s MALLOC-FAILED\n", Tag)
+        return 1
+    string.strcpy(CmdBuffer, CommandLine)
+
+    # si/pi：T() 构造只 alloca 不 memset，必须显式清零
+    # 先例：TransPyV/App/lib/Phase/BuildPipeline.vp:530-532
+    #       （string.memset(t.CPtr(c.Addr(si)), 0, STARTUPINFOA.__sizeof__())）
+    # 类型引用写法：includes/subprocess.vp:99-100
+    # c.Addr() 取址：includes/condition.vp:26；t.CPtr(c.Addr(x))：includes/subprocess.vp:121
+    StartupInfo: w32.win32process.STARTUPINFOA = w32.win32process.STARTUPINFOA()
+    ProcessInfo: w32.win32process.PROCESS_INFORMATION = w32.win32process.PROCESS_INFORMATION()
+    string.memset(t.CPtr(&StartupInfo), 0, w32.win32process.STARTUPINFOA.__sizeof__())
+    string.memset(t.CPtr(&ProcessInfo), 0, w32.win32process.PROCESS_INFORMATION.__sizeof__())
+    # si.cb = 结构体大小：includes/subprocess.vp:100
+    StartupInfo.cb = w32.win32process.STARTUPINFOA.__sizeof__()
+
+    # 应用名描述：None 显式打印成 NULL（不臆造内容，也不兜底成别的路径）
+    AppDesc: str = "NULL"
+    if AppName is not None:
+        AppDesc = AppName
+
+    # GetLastError 基线：调用前读取，用于判定 err 是否为残留值
+    # GetLastError 声明：includes/w32/win32base.vp:62
+    # 调用后紧跟读取的先例：ViperApps/ViperZipfileProject/App/main.vp:116
+    PreError: uint32 = w32.win32base.GetLastError()
+
+    # 单条调用：10 实参，lpEnvironment / lpCurrentDirectory 恒 NULL
+    # 先例：includes/subprocess.vp:112-123（t.CPtr(0) 表 NULL 见 :113/:115/:119/:120）
+    OkValue: int = w32.win32process.CreateProcessA(
+        AppName, CmdBuffer, t.CPtr(0), t.CPtr(0), InheritHandles, CreationFlags,
+        t.CPtr(0), t.CPtr(0), t.CPtr(&StartupInfo), t.CPtr(&ProcessInfo))
+    # GetLastError 必须紧跟调用读取（printf 等都会覆盖它）
+    ErrorValue: uint32 = w32.win32base.GetLastError()
+
+    # --- 字段转储：整数字段与指针字段统一 uint64() 后按 %llu 打印 ---
+    # uint64(结构体字段) 先例：TransPyV/App/lib/Stub/StubMerger/StubMergerStore.vp:79
+    #   （uint64(scan_result.Entries)）
+    # uint64(c.Addr(x)) 先例：ViperApps/ViperOS/VKernel/Kernel/sched/sched.vp:217
+    #   （entry_addr: uint64 = uint64(c.Addr(_thread_entry))）
+    # uint64(malloc 缓冲) 先例：TransPyV/App/lib/Stub/StubMerger/StubMergerBuild.vp:1313 段
+    #   （uint64(ext_ptr)）
+    # %llu 先例：includes/memhub.vp:792
+    CbValue: uint64 = uint64(StartupInfo.cb)
+    FlagsValue: uint64 = uint64(StartupInfo.dwFlags)
+    CbReserved2Value: uint64 = uint64(StartupInfo.cbReserved2)
+    Reserved2Value: uint64 = uint64(StartupInfo.lpReserved2)
+    StdInputValue: uint64 = uint64(StartupInfo.hStdInput)
+    StdOutputValue: uint64 = uint64(StartupInfo.hStdOutput)
+    StdErrorValue: uint64 = uint64(StartupInfo.hStdError)
+    SiAddress: uint64 = uint64(&StartupInfo)
+    PiAddress: uint64 = uint64(&ProcessInfo)
+    CmdAddress: uint64 = uint64(CmdBuffer)
+
+    # %s 传 str 先例：ViperApps/ViperZipfileProject/App/main.vp:29
+    stdio.printf("[CPW] %s ok=%d err=%llu pre_err=%llu app=%s cmd=%s cl.addr=%llu\n",
+        Tag, OkValue, uint64(ErrorValue), uint64(PreError),
+        AppDesc, CommandLine, CmdAddress)
+    # si 关键字段：cb / dwFlags / cbReserved2 / lpReserved2 / 三个 hStd* + si/pi 地址
+    # 字段定义：includes/w32/win32process.vp:42-60（STARTUPINFOA）
+    stdio.printf("[CPW] %s si.cb=%llu si.dwFlags=%llu si.cbReserved2=%llu si.lpReserved2=%llu si.hStdIn=%llu si.hStdOut=%llu si.hStdErr=%llu si.addr=%llu pi.addr=%llu\n",
+        Tag, CbValue, FlagsValue, CbReserved2Value, Reserved2Value,
+        StdInputValue, StdOutputValue, StdErrorValue, SiAddress, PiAddress)
+
+    # 成功时关闭子进程句柄（避免句柄泄漏）
+    # 先例：includes/subprocess.vp:179-180
+    if OkValue != 0:
+        w32.win32base.CloseHandle(ProcessInfo.hThread)
+        w32.win32base.CloseHandle(ProcessInfo.hProcess)
+    stdlib.free(CmdBuffer)
+    # stdout 全缓冲，逐组刷新以保证崩溃前输出可见
+    # 先例：ViperApps/ViperZipfileProject/App/main.vp:33（stdio.fflush(None)）
+    stdio.fflush(None)
+    return 0
+
+
+# ============================================================
+# 对照组：本进程 GetCurrentDirectoryA（证明本进程可正常调 Win32）
+# ============================================================
+def PrintCurrentDirectory() -> int:
+    """[CPW] 对照组：打印本进程当前目录与错误码"""
+    # 缓冲与调用形态先例：includes/os/_win32.vp:76-91（getcwd：malloc → 调用 →
+    # buf[length] = 0 → str(buf)）；MAX_PATH 声明：includes/w32/win32base.vp:18
+    CwdLength: ULONG = 0
+    CwdError: uint32 = 0
+    CwdDesc: str = "<empty>"
+    CwdBuffer: bytes = stdlib.malloc(w32.win32base.MAX_PATH + 1)
+    if CwdBuffer is None:
+        stdio.printf("[CPW] control GetCurrentDirectoryA MALLOC-FAILED\n")
+        return 1
+    # GetCurrentDirectoryA 声明：includes/w32/win32file.vp:129
+    CwdLength = w32.win32file.GetCurrentDirectoryA(w32.win32base.MAX_PATH + 1, CwdBuffer)
+    CwdError = w32.win32base.GetLastError()   # 必须紧跟调用读取
+    if CwdLength > 0:
+        if CwdLength < w32.win32base.MAX_PATH + 1:
+            CwdBuffer[CwdLength] = 0
+        else:
+            CwdBuffer[w32.win32base.MAX_PATH] = 0   # 缓冲区不足：截断显示
+        CwdDesc = str(CwdBuffer)
+    stdio.printf("[CPW] control GetCurrentDirectoryA len=%llu err=%llu cwd=%s\n",
+        uint64(CwdLength), uint64(CwdError), CwdDesc)
+    stdlib.free(CwdBuffer)
+    stdio.fflush(None)
+    return 0
+
+
+# ============================================================
+# main: 入口
+# @t.CExport + main() -> int 先例：ViperApps/ViperZipfileProject/App/main.vp:305-306
+# ============================================================
+@t.CExport
+def main() -> int:
+    # 控制台 UTF-8（中文注释/标签不乱码）
+    # 声明：includes/w32/win32console.vp:81-82
+    # 先例：ViperApps/ViperQtHelloWorld/App/main.vp:18+34-35
+    w32.win32console.SetConsoleOutputCP(PAGE_CODE)
+    w32.win32console.SetConsoleCP(PAGE_CODE)
+
+    # stdio.printf 声明：includes/stdio.vp:4
+    stdio.printf("ViperCPW: CreateProcessA standalone repro (Viper host, not TransPyV.exe)\n")
+    PrintCurrentDirectory()
+
+    # #1 基线：NULL 应用名 + inh=1 + flags=0
+    ProbeCreateProcessA("#1 NULL-app inh=1 flags=0", None, "llc --version", 1, 0)
+    # #2 同 #1 但 bInheritHandles=0
+    ProbeCreateProcessA("#2 NULL-app inh=0 flags=0", None, "llc --version", 0, 0)
+    # #3 同 #1 但 dwCreationFlags=CREATE_NO_WINDOW
+    # CREATE_NO_WINDOW 定义：includes/w32/win32process.vp:23
+    ProbeCreateProcessA("#3 NULL-app inh=1 flags=CREATE_NO_WINDOW", None, "llc --version",
+                        1, w32.win32process.CREATE_NO_WINDOW)
+    # #4 绝对路径应用名
+    ProbeCreateProcessA("#4 abs-app", "D:\\msys64\\clang64\\bin\\llc.exe", "llc --version", 1, 0)
+    # #5 报错里那条原样命令行（正斜杠相对路径，与 TPV 探针 #3 逐字相同）
+    ProbeCreateProcessA("#5 raw-cmdline(fwd slashes)", None,
+                        "llc -filetype=obj -relocation-model=pic -o ./TransPyV/.tpv_build/output/xx/xxx.obj ./TransPyV/.tpv_build/temp/xx/xxx.ll",
+                        1, 0)
+
+    stdio.printf("ViperCPW: DONE\n")
+    stdio.fflush(None)
+    return 0

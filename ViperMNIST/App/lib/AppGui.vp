@@ -1,0 +1,1241 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# AppGui - ViperMNIST 的 Qt6 面板（整合进现有工程, 无参数启动）
+#
+# OOP 范式: 界面控件与运行期数据都是 AppGui 的字段(全部在类中预先声明),
+#   方法即事件处理; Qt 信号/定时器只能收裸函数指针, 故用模块级跳板
+#   (CbXxx) 转发到单例 _g_ui, 避免把状态摊成几十个模块级 global。
+#
+# 两个页签:
+#   1) 数据 / 训练: 下载(或复制链接/指定本地 .gz)、训练参数、
+#      后台线程训练 + QTimer 轮询、Qt Charts 实时 loss/acc 曲线、日志
+#   2) 推理: 手绘 Canvas → 识别 → 逐层点亮(2D 概率条 + 3D 网络图)
+#
+# 线程模型: 训练在 vthreading 后台线程跑, 只写 MnistNet 的 prog_* 进度总线;
+#   主线程用 QTimer 轮询刷新界面, 不与之共享 Qt 对象。
+# ============================================================
+import t, c
+from stdint import *
+import stdlib
+import string
+import vqt6
+import vthreading
+import memhub
+import torch
+import viperlib
+import w32.fileio as fileio
+import w32.win32file as win32file
+import lib.MnistData as MnistData
+import lib.MnistNet as MnistNet
+
+# 3D 结构图输入层抽稀网格(与 MnistNet.GRAPH_IN 保持一致)
+define GR_IN = 64                 # 8 x 8
+# Qt 的最大尺寸哨兵(= QWIDGETSIZE_MAX, QWidget maximumWidth/Height 的默认值)。
+# setMaximumSize 的 0 会被当成字面 0 把该维度钉死, 要"放开某一维"必须显式传本值。
+define QWIDGETSIZE_MAX = 16777215
+# 曲线滑动窗口: 每条折线最多保留多少个点(过久的丢弃)
+define CHART_KEEP = 800
+# 动画: 每阶段 tick 数(25ms/tick)
+define ANIM_SPAN = 16
+
+
+@t.NoVTable
+class AppGui:
+    # ---- 应用与主窗 ----
+    App: vqt6.QApplication*
+    Win: vqt6.QMainWindow*
+    Tabs: vqt6.QTabWidget*
+    LblStatus: vqt6.QLabel*
+
+    # ---- 数据页 ----
+    EditDataDir: vqt6.QLineEdit*
+    BtnDownload: vqt6.QPushButton*
+    LblLocal: vqt6.QLabel*
+    LblDataState: vqt6.QLabel*
+    LocalIm: str
+    LocalLb: str
+    Mask: int                          # 最近一次完整性检测的缺失掩码
+
+    # ---- 训练参数 ----
+    RbMlp: vqt6.QRadioButton*      # 架构: MLP(全连接)
+    RbCnn: vqt6.QRadioButton*      # 架构: CNN(卷积 + 池化)
+    SpC1: vqt6.QSpinBox*           # CNN conv1 通道数
+    SpC2: vqt6.QSpinBox*           # CNN conv2 通道数
+    ChkAug: vqt6.QCheckBox*        # 数据增强(随机平移)
+    SpEpochs: vqt6.QSpinBox*
+    SpBatch: vqt6.QSpinBox*
+    SpHidden: vqt6.QSpinBox*
+    SpLimit: vqt6.QSpinBox*
+    SpSeed: vqt6.QSpinBox*
+    EditLr: vqt6.QLineEdit*
+    EditSave: vqt6.QLineEdit*
+    ArchSel: int                        # 单选框当前选中的架构(toggled 会双触发, 用它去重)
+
+    # ---- 训练页 ----
+    BtnTrain: vqt6.QPushButton*
+    BtnStop: vqt6.QPushButton*
+    LblTrainInfo: vqt6.QLabel*
+    Pbar: vqt6.QProgressBar*
+    Log: vqt6.QPlainTextEdit*
+    Chart: vqt6.ChartView*
+    LineLoss: t.CPtr
+    LineAcc: t.CPtr
+    ChartSynced: int
+    # 验证集曲线(每 epoch 一个点, 与训练曲线分开同步)
+    LineValLoss: t.CPtr
+    LineValAcc: t.CPtr
+    ChartSyncedVal: int
+
+    # ---- 推理页 ----
+    Canvas: vqt6.Canvas*
+    Graph: vqt6.Graph3D*
+    BtnUse: vqt6.QPushButton*
+    BtnClear: vqt6.QPushButton*
+    BtnPick: vqt6.QPushButton*
+    LblResult: vqt6.QLabel*
+    LblTop: vqt6.QLabel*
+    Bar0: vqt6.QProgressBar*
+    Bar1: vqt6.QProgressBar*
+    Bar2: vqt6.QProgressBar*
+    Bar3: vqt6.QProgressBar*
+    Bar4: vqt6.QProgressBar*
+    Bar5: vqt6.QProgressBar*
+    Bar6: vqt6.QProgressBar*
+    Bar7: vqt6.QProgressBar*
+    Bar8: vqt6.QProgressBar*
+    Bar9: vqt6.QProgressBar*
+
+    # ---- 计时器 ----
+    TimerPoll: vqt6.QTimer*
+    TimerAnim: vqt6.QTimer*
+
+    # ---- 运行期: 内存池与网络 ----
+    Pool: memhub.MemBuddy*
+    Mark: sizet
+    Net: MnistNet.Net*
+    Hidden: sizet
+    CurArch: int                       # 当前 Net 的架构(ARCH_MLP / ARCH_CNN)
+    CurC1: sizet                       # 当前 Net 的 conv1 通道数
+    CurC2: sizet                       # 当前 Net 的 conv2 通道数
+
+    # ---- 运行期: 训练 ----
+    # 只存线程句柄: Thread 对象本身是创建帧的栈 alloca, 跨帧持有会悬垂;
+    # 句柄由 on_start_train 在 Thread 尚存活时取出, 之后用模块级
+    # wait_handle/close_handle 操作。
+    ThreadH: t.CPtr
+    XBuf: double*
+    YBuf: int*
+    NTrain: sizet
+    CurEpochs: int
+    CurBatch: int
+    CurLr: double
+    CurAug: int                        # 训练时是否做数据增强(1=开)
+    Seed: int
+    SavePath: str
+    Training: int
+
+    # ---- 运行期: 推理 ----
+    Img28: bytes
+    Sample28: bytes
+    HaveSample: int
+    TestRaw: t.CPtr
+    TestLbl: t.CPtr
+    TestN: sizet
+    Probs: double*
+    HiddenBuf: double*
+    Nodes: double*
+    Edges: double*
+    EdgeN: sizet
+    Sizes: int*
+
+    # ---- 动画状态 ----
+    AnimPhase: int
+    AnimT: int
+    TargetProbs: double*
+
+    # ========================================================
+    # 构造 / 入口
+    # ========================================================
+    def __init__(self, pool: memhub.MemBuddy*):
+        self.Pool = pool
+        self.Mark = pool.mark()
+        self.Net = None
+        self.Hidden = 0
+        self.CurArch = MnistNet.ARCH_MLP
+        self.CurC1 = 0
+        self.CurC2 = 0
+        self.ArchSel = MnistNet.ARCH_MLP
+        self.LocalIm = None
+        self.LocalLb = None
+        self.Mask = 0
+        self.XBuf = None
+        self.YBuf = None
+        self.NTrain = 0
+        self.CurEpochs = 0
+        self.CurBatch = 0
+        self.CurLr = double(0.1)
+        self.CurAug = 1
+        self.Seed = 42
+        self.SavePath = "mnist.bin"
+        self.Training = 0
+        self.ThreadH = None
+        self.ChartSynced = 0
+        self.ChartSyncedVal = 0
+        self.Img28 = stdlib.malloc(MnistData.N_IN)
+        self.Sample28 = stdlib.malloc(MnistData.N_IN)
+        self.HaveSample = 0
+        self.TestRaw = None
+        self.TestLbl = None
+        self.TestN = 0
+        self.Probs = None
+        self.HiddenBuf = None
+        self.Nodes = None
+        self.Edges = None
+        self.EdgeN = 0
+        self.Sizes = None
+        self.TargetProbs = None
+        self.AnimPhase = 99
+        self.AnimT = 0
+        self.App = vqt6.QApplication([])
+        # 全局字体: 微软雅黑。Qt 默认是 Segoe UI, 中文全靠字体回退, 中英混排
+        # 的字形/行距不一致。必须在建控件之前设 —— Qt 是控件构造时从应用字体
+        # 继承的; 也不能改成给主窗口挂 font-family 样式表: Qt Charts 的标题/
+        # 图例/坐标轴画在 QChart(QGraphicsWidget)上, 样式表够不到。
+        self.App.set_font_family("Microsoft YaHei")
+        self.build_ui()
+        self.check_data()          # 启动即自动检测 data 完整性并刷新状态标签
+
+    def exec(self) -> int:
+        d: str = self.data_dir()
+        self.set_status(f"池: 512MB   数据目录: {d}")
+        self.log(f"数据目录: {d}")
+        self.log("步骤: 1) 联网下载 或 选择本地 .gz(图像+标签)  2) 设置参数  "
+                 "3) 开始训练  4) 到“推理”页手写识别")
+        self.Win.show()
+        return self.App.exec()
+
+    # ========================================================
+    # 小工具
+    # ========================================================
+    def log(self, msg: str):
+        if self.Log is not None:
+            self.Log.append(msg)
+
+    def set_status(self, msg: str):
+        if self.LblStatus is not None:
+            self.LblStatus.setText(msg)
+
+    def bar_at(self, i: int) -> vqt6.QProgressBar*:
+        if i == 0:
+            return self.Bar0
+        if i == 1:
+            return self.Bar1
+        if i == 2:
+            return self.Bar2
+        if i == 3:
+            return self.Bar3
+        if i == 4:
+            return self.Bar4
+        if i == 5:
+            return self.Bar5
+        if i == 6:
+            return self.Bar6
+        if i == 7:
+            return self.Bar7
+        if i == 8:
+            return self.Bar8
+        return self.Bar9
+
+    def top_index(self, probs: double*, ex1: int,
+                  ex2: int, ex3: int = -1) -> int:
+        """概率最高的类别下标, 跳过 ex1/ex2/ex3(传 -1 表示不跳过)"""
+        p: double* = probs
+        best: int = -1
+        bv: double = double(-1.0)
+        for i in range(10):
+            if i != ex1 and i != ex2 and i != ex3:
+                if p[i] > bv:
+                    bv = p[i]
+                    best = i
+        return best
+
+    def make_label(self, text: str, qss: str) -> vqt6.QLabel*:
+        lb: vqt6.QLabel* = vqt6.QLabel(text)
+        if qss is not None:
+            lb.setStyleSheet(qss)
+        return lb
+
+    def make_col_title(self, text: str) -> vqt6.QLabel*:
+        """推理页的列标题: 统一字号样式, 并把最大高度钉死在文字高度上
+
+        QLabel 竖向默认是 Preferred 策略, 放进 QVBoxLayout 后, 剩余高度会被
+        所有 Preferred 控件均分, 标题条就被撑成一大块(用户反馈的
+        "手写数字 / 网络结构 / 0~9 概率 占的 height 太大")。
+        只封高度(24px), 宽度用 QWIDGETSIZE_MAX 放开。
+        """
+        lb: vqt6.QLabel* = vqt6.QLabel(text)
+        lb.setStyleSheet("font-size:14px;font-weight:bold;color:#e8ecf4;")
+        # 只封高度, 宽度用 QWIDGETSIZE_MAX(Qt 最大尺寸哨兵)放开。
+        # 不能用 0 表示"不限制": setMaximumSize 的 0 会把该维度钉成 0
+        # (标题是非换行 QLabel, minimumSizeHint=整段文字宽度, 宽度被夹回最小
+        #  宽度才侥幸还能显示; 换成开了 wordWrap 的控件就会整块隐形)。
+        vqt6.vqt6_qwidget_set_maximum_size(lb._ptr, QWIDGETSIZE_MAX, 24)
+        return lb
+
+    def make_button(self, text: str, cb: bytes) -> vqt6.QPushButton*:
+        b: vqt6.QPushButton* = vqt6.QPushButton(text)
+        b.clicked(cb, 0)
+        return b
+
+    def make_bar(self, digit: int) -> vqt6.QProgressBar*:
+        b: vqt6.QProgressBar* = vqt6.QProgressBar()
+        b.setRange(0, 1000)
+        b.setValue(0)
+        # 左侧留白用 format 的前导空格做, 不能用 padding-left:
+        # QProgressBar 的文本绘制矩形是 SE_ProgressBarLabel, 直接返回整个控件
+        # rect(opt->rect), 样式表里的 padding 不会作用到文本上, 只有
+        # text-align 有效。所以写 padding-left 看着有间距实际贴边。
+        b.setFormat(f"   {digit}   %p%")
+        b.setStyleSheet(
+            "QProgressBar{background:#1c1f26;border:1px solid #2c3038;border-radius:3px;"
+            "text-align:left;color:#dfe4ec;}"
+            "QProgressBar::chunk{background:#4dabf7;border-radius:2px;}")
+        return b
+
+    # ========================================================
+    # 界面搭建
+    # ========================================================
+    def build_ui(self):
+        self.Win = vqt6.QMainWindow()
+        self.Win.setWindowTitle("ViperMNIST - 手写数字识别 (Qt 面板)")
+        # 推理页三列的最小宽度合计约 1210, 默认窗宽要留出余量,
+        # 否则 3D 图会被挤到刚好卡在最小尺寸上
+        self.Win.resize(1280, 840)
+        self.Win.setStyleSheet(
+            "QMainWindow,QWidget{background:#15171d;color:#dfe4ec;}"
+            "QTabWidget::pane{border:1px solid #2c3038;}"
+            "QTabBar::tab{background:#1c1f26;color:#9aa3b0;padding:6px 14px;}"
+            "QTabBar::tab:selected{background:#242833;color:#ffffff;}"
+            "QLineEdit,QSpinBox,QPlainTextEdit,QProgressBar{"
+            "background:#1c1f26;border:1px solid #2c3038;border-radius:3px;"
+            "color:#dfe4ec;padding:3px;}"
+            "QPushButton{background:#2a6da8;color:#ffffff;border:none;"
+            "border-radius:4px;padding:6px 12px;}"
+            "QPushButton:hover{background:#327cbd;}"
+            "QPushButton:disabled{background:#2c3038;color:#6b7280;}"
+            "QLabel{color:#dfe4ec;}"
+            # 单选/复选指示器是自绘的(vqt6 里 QPainter 画圆环/方框+对勾),
+            # 这里只给文字配色与图标-文字间距; 指示器配色来自 QPalette
+            "QRadioButton{color:#dfe4ec;spacing:8px;}"
+            "QCheckBox{color:#dfe4ec;spacing:8px;}"
+            "QStatusBar{background:#101218;color:#8a93a1;}")
+        self.Tabs = vqt6.QTabWidget()
+        self.Tabs.addTab(self.build_data_page()._ptr, "数据 / 训练")
+        self.Tabs.addTab(self.build_infer_page()._ptr, "推理")
+        self.Win.setCentralWidget(self.Tabs._ptr)
+
+        self.LblStatus = self.make_label("池: 512MB   数据目录: data", "color:#8a93a1;")
+        # statusBar() 返回裸指针: 返回包装类对象(按值 struct)的方法在跨模块
+        # 调用时返回类型无法精确解析(编译器 fail-fast), 故此处直连 FFI。
+        # 注解写 t.CPtr 而非 vqt6.QtStatusBarPtr —— 跨模块 typedef 注解
+        # 不在解析白名单内, 会走"类型注解解析失败"诊断路径。
+        sb: t.CPtr = self.Win.statusBar()
+        vqt6.vqt6_qstatusbar_add_widget(sb, self.LblStatus._ptr, 0)
+
+        self.TimerPoll = vqt6.QTimer()
+        self.TimerPoll.timeout(CbPollTraining, 0)
+        self.TimerAnim = vqt6.QTimer()
+        self.TimerAnim.timeout(CbAnimTick, 0)
+
+    def build_data_page(self) -> vqt6.QWidget*:
+        page: vqt6.QWidget* = vqt6.QWidget()
+        root: vqt6.QHBoxLayout* = vqt6.QHBoxLayout(page)
+        left: vqt6.QVBoxLayout* = vqt6.QVBoxLayout()
+        right: vqt6.QVBoxLayout* = vqt6.QVBoxLayout()
+
+        left.addWidget(self.make_label("数据准备", "font-size:14px;font-weight:bold;color:#e8ecf4;")._ptr)
+        # 数据目录: 默认 <exe 同目录>/data, 也可自行选择
+        self.EditDataDir = vqt6.QLineEdit(self.default_data_dir())
+        left.addWidget(self.EditDataDir._ptr)
+        row0: vqt6.QHBoxLayout* = vqt6.QHBoxLayout()
+        row0.addWidget(self.make_button("选择目录", CbPickDir)._ptr)
+        row0.addWidget(self.make_button("重新检测", CbCheckData)._ptr)
+        row0.addWidget(self.make_button("复制下载链接", CbCopyLink)._ptr)
+        left.addLayout(row0._ptr)
+        self.LblDataState = self.make_label("数据检测中 ...", "color:#9aa3b0;")
+        left.addWidget(self.LblDataState._ptr)
+        row1: vqt6.QHBoxLayout* = vqt6.QHBoxLayout()
+        self.BtnDownload = self.make_button("联网下载缺失", CbDownload)
+        row1.addWidget(self.BtnDownload._ptr)
+        row1.addWidget(self.make_button("选择本地 .gz(图像+标签)", CbPickLocal)._ptr)
+        left.addLayout(row1._ptr)
+        self.LblLocal = self.make_label("本地文件: (未指定)", "color:#9aa3b0;")
+        left.addWidget(self.LblLocal._ptr)
+
+        left.addWidget(self.make_label("训练参数", "font-size:14px;font-weight:bold;color:#e8ecf4;")._ptr)
+        # 架构: 两个 QRadioButton 放进同一个布局 → 最终同父容器, Qt 自动互斥
+        row_arch: vqt6.QHBoxLayout* = vqt6.QHBoxLayout()
+        self.RbMlp = vqt6.QRadioButton("MLP 全连接")
+        self.RbMlp.setChecked(1)
+        self.RbMlp.toggled(CbArchChanged, 0)
+        self.RbCnn = vqt6.QRadioButton("CNN 卷积")
+        self.RbCnn.toggled(CbArchChanged, 0)
+        row_arch.addWidget(self.RbMlp._ptr)
+        row_arch.addWidget(self.RbCnn._ptr)
+        left.addLayout(row_arch._ptr)
+        self.SpEpochs = vqt6.QSpinBox()
+        self.SpEpochs.setRange(1, 100)
+        self.SpEpochs.setValue(5)
+        self.SpEpochs.setPrefix("epochs  ")
+        left.addWidget(self.SpEpochs._ptr)
+        self.SpBatch = vqt6.QSpinBox()
+        self.SpBatch.setRange(1, 1024)
+        self.SpBatch.setValue(64)
+        self.SpBatch.setPrefix("batch  ")
+        left.addWidget(self.SpBatch._ptr)
+        self.SpHidden = vqt6.QSpinBox()
+        self.SpHidden.setRange(8, 2048)
+        self.SpHidden.setValue(256)
+        self.SpHidden.setPrefix("hidden  ")
+        left.addWidget(self.SpHidden._ptr)
+        # CNN 通道数: 只有选中 CNN 时才可用(由 on_arch_changed 切换)
+        self.SpC1 = vqt6.QSpinBox()
+        self.SpC1.setRange(1, 64)
+        self.SpC1.setValue(8)
+        self.SpC1.setPrefix("conv1 通道  ")
+        self.SpC1.setEnabled(0)
+        left.addWidget(self.SpC1._ptr)
+        self.SpC2 = vqt6.QSpinBox()
+        self.SpC2.setRange(1, 64)
+        self.SpC2.setValue(16)
+        self.SpC2.setPrefix("conv2 通道  ")
+        self.SpC2.setEnabled(0)
+        left.addWidget(self.SpC2._ptr)
+        self.SpLimit = vqt6.QSpinBox()
+        self.SpLimit.setRange(0, 60000)
+        self.SpLimit.setValue(60000)
+        self.SpLimit.setPrefix("limit  ")
+        left.addWidget(self.SpLimit._ptr)
+        self.SpSeed = vqt6.QSpinBox()
+        self.SpSeed.setRange(0, 999999)
+        self.SpSeed.setValue(42)
+        self.SpSeed.setPrefix("seed  ")
+        left.addWidget(self.SpSeed._ptr)
+        self.ChkAug = vqt6.QCheckBox("数据增强(随机平移 ±2px)")
+        self.ChkAug.setChecked(1)
+        left.addWidget(self.ChkAug._ptr)
+        # 与重球法(momentum 0.9)配套的默认学习率: 动量把等效步长放大约 10 倍,
+        # 仍用 0.1 会直接发散(PyTorch 官方 MNIST 例子也是 0.01 + momentum 0.9)
+        self.EditLr = vqt6.QLineEdit("0.01")
+        self.EditLr.setPlaceholderText("learning rate")
+        left.addWidget(self.make_label("学习率", "color:#9aa3b0;")._ptr)
+        left.addWidget(self.EditLr._ptr)
+        self.EditSave = vqt6.QLineEdit(self.default_model_path())
+        left.addWidget(self.make_label("模型保存路径", "color:#9aa3b0;")._ptr)
+        left.addWidget(self.EditSave._ptr)
+
+        row2: vqt6.QHBoxLayout* = vqt6.QHBoxLayout()
+        self.BtnTrain = self.make_button("开始训练", CbStartTrain)
+        self.BtnStop = self.make_button("停止", CbStopTrain)
+        self.BtnStop.setEnabled(0)
+        row2.addWidget(self.BtnTrain._ptr)
+        row2.addWidget(self.BtnStop._ptr)
+        row2.addWidget(self.make_button("加载模型", CbLoadModel)._ptr)
+        left.addLayout(row2._ptr)
+
+        self.Pbar = vqt6.QProgressBar()
+        self.Pbar.setRange(0, 1000)
+        self.Pbar.setValue(0)
+        self.Pbar.setFormat("%p%")
+        left.addWidget(self.Pbar._ptr)
+        self.LblTrainInfo = self.make_label("就绪", "color:#9aa3b0;")
+        left.addWidget(self.LblTrainInfo._ptr)
+        self.Log = vqt6.QPlainTextEdit()
+        self.Log.setReadOnly(1)
+        left.addWidget(self.Log._ptr)
+
+        rowc: vqt6.QHBoxLayout* = vqt6.QHBoxLayout()
+        rowc.addWidget(self.make_label("loss / accuracy 曲线", "font-size:14px;font-weight:bold;color:#e8ecf4;")._ptr)
+        rowc.addStretch(1)
+        rowc.addWidget(self.make_button("查看大图", CbZoomChart)._ptr)
+        right.addLayout(rowc._ptr)
+        self.Chart = vqt6.ChartView()
+        self.Chart.setTitle("训练 / 验证 曲线")
+        self.Chart.setBackground(20, 22, 28)
+        # 滑动窗口: 每条线只保留最近 CHART_KEEP 个点, 过久的自动丢弃
+        self.Chart.setMaxPoints(CHART_KEEP)
+        self.LineLoss = self.Chart.addLine("loss", 255, 107, 107, 0)
+        self.LineAcc = self.Chart.addLine("acc %", 77, 171, 247, 1)
+        # 验证集曲线(每 epoch 一个点, 走与训练曲线相同的左右轴口径)
+        self.LineValLoss = self.Chart.addLine("val loss", 214, 143, 90, 0)
+        self.LineValAcc = self.Chart.addLine("val acc %", 96, 190, 160, 1)
+        right.addWidget(self.Chart._ptr)
+
+        root.addLayout(left._ptr)
+        root.addLayout(right._ptr)
+        return page
+
+    def build_infer_page(self) -> vqt6.QWidget*:
+        page: vqt6.QWidget* = vqt6.QWidget()
+        root: vqt6.QHBoxLayout* = vqt6.QHBoxLayout(page)
+
+        col_draw: vqt6.QVBoxLayout* = vqt6.QVBoxLayout()
+        col_draw.addWidget(self.make_col_title("手写数字")._ptr)
+        self.Canvas = vqt6.Canvas()
+        self.Canvas.setPen(255, 255, 255, double(0.075))
+        self.Canvas.setBackground(10, 12, 16)
+        self.Canvas.changed(CbCanvasChanged, 0)
+        # 手写板只是 28x28 的输入源, 不需要占宽: 封顶尺寸, 把宽度让给 3D 图
+        vqt6.vqt6_qwidget_set_maximum_size(self.Canvas._ptr, 340, 340)
+        col_draw.addWidget(self.Canvas._ptr)
+        rowd: vqt6.QHBoxLayout* = vqt6.QHBoxLayout()
+        self.BtnUse = self.make_button("识别", CbUse)
+        self.BtnClear = self.make_button("清空", CbClearCanvas)
+        self.BtnPick = self.make_button("加载测试样本", CbPickSample)
+        rowd.addWidget(self.BtnUse._ptr)
+        rowd.addWidget(self.BtnClear._ptr)
+        rowd.addWidget(self.BtnPick._ptr)
+        col_draw.addLayout(rowd._ptr)
+        self.LblTop = self.make_label("模型就绪后即可识别", "color:#9aa3b0;")
+        # 预测文案现在是三行(预测：/ 主选：/ 次选：), 最长一行约 242px, 本来就
+        # 放得下左列, 不需要自动换行、也不需要封宽度 —— 之前那套(wordWrap=1 +
+        # set_maximum_size(340, 0))反而把这一行状态文字整块搞隐形了: 换行 QLabel
+        # 的 minimumSizeHint 很小, 高度被 setMaximumSize 的 0 钉成 0 就成了不可见。
+        col_draw.addWidget(self.LblTop._ptr)
+        # 底部留一个撑杆: 剩余高度给撑杆, 上面的控件各自保持自然高度,
+        # 否则会被 QVBoxLayout 均分(标题、状态文字全被撑高)
+        col_draw.addStretch(1)
+
+        col_3d: vqt6.QVBoxLayout* = vqt6.QVBoxLayout()
+        col_3d.addWidget(self.make_col_title("网络结构(左键拖拽旋转 / 滚轮缩放)")._ptr)
+        self.Graph = vqt6.Graph3D()
+        self.Graph.setBackground(14, 16, 22)
+        self.Graph.setEdgeBudget(3000)
+        self.Graph.setEdgeThreshold(double(0.05))
+        self.Graph.setNodeScale(double(1.0))
+        # 3D 图是这一页的主体: Graph3D 自带的最小尺寸只有 320x240, 在 1180 宽的
+        # 三列布局里被压成 1/3 宽。抬高最小尺寸, 让布局把宽度优先分给它。
+        # 直连 FFI(同 statusBar 处说明): 不为单个尺寸再加一层包装方法。
+        vqt6.vqt6_qwidget_set_minimum_size(self.Graph._ptr, 620, 520)
+        col_3d.addWidget(self.Graph._ptr)
+
+        col_prob: vqt6.QVBoxLayout* = vqt6.QVBoxLayout()
+        col_prob.addWidget(self.make_col_title("0~9 概率")._ptr)
+        self.LblResult = self.make_label("?", "font-size:40px;font-weight:bold;color:#ffbe46;")
+        # 大号结果数字在整列里居中: QLabel 默认是 AlignLeft, 会贴着左边缘
+        self.LblResult.setAlignment(vqt6.QT_ALIGN_CENTER)
+        col_prob.addWidget(self.LblResult._ptr)
+        self.Bar0 = self.make_bar(0)
+        self.Bar1 = self.make_bar(1)
+        self.Bar2 = self.make_bar(2)
+        self.Bar3 = self.make_bar(3)
+        self.Bar4 = self.make_bar(4)
+        self.Bar5 = self.make_bar(5)
+        self.Bar6 = self.make_bar(6)
+        self.Bar7 = self.make_bar(7)
+        self.Bar8 = self.make_bar(8)
+        self.Bar9 = self.make_bar(9)
+        col_prob.addWidget(self.Bar0._ptr)
+        col_prob.addWidget(self.Bar1._ptr)
+        col_prob.addWidget(self.Bar2._ptr)
+        col_prob.addWidget(self.Bar3._ptr)
+        col_prob.addWidget(self.Bar4._ptr)
+        col_prob.addWidget(self.Bar5._ptr)
+        col_prob.addWidget(self.Bar6._ptr)
+        col_prob.addWidget(self.Bar7._ptr)
+        col_prob.addWidget(self.Bar8._ptr)
+        col_prob.addWidget(self.Bar9._ptr)
+        # 同 col_draw: 剩余高度给撑杆, 而不是把标题和 10 条进度条一起撑高
+        col_prob.addStretch(1)
+
+        root.addLayout(col_draw._ptr)
+        root.addLayout(col_3d._ptr)
+        root.addLayout(col_prob._ptr)
+        return page
+
+    # ========================================================
+    # 数据页动作
+    # ========================================================
+    def exe_dir(self) -> str:
+        """当前可执行文件所在目录(GetModuleFileNameA), 用 / 作分隔符"""
+        buf: bytes = stdlib.malloc(1024)
+        if buf is None:
+            return "."
+        # hModule 传空指针用 t.CPtr(0): HANDLE 是 VOIDPTR, 整数 0 不能隐式转指针
+        win32file.GetModuleFileNameA(t.CPtr(0), buf, ULONG(1024))
+        n: sizet = string.strlen(buf)
+        # 第一步: 从右往左找最后一个路径分隔符, 在那里截断(去掉文件名本身)
+        cut: sizet = 0
+        found: int = 0
+        i: sizet = n
+        while i > 0:
+            ch: char = buf[i - 1]
+            if ch == '\\' or ch == '/':
+                cut = i - 1
+                found = 1
+                break
+            i -= 1
+        if found == 0:
+            return "."
+        buf[cut] = '\0'
+        # 第二步: 剩下的目录部分统一成 '/' 分隔
+        for j in range(cut):
+            if buf[j] == '\\':
+                buf[j] = '/'
+        return buf
+
+    def default_data_dir(self) -> str:
+        """默认数据目录 = <exe 同目录>/data"""
+        buf: str = stdlib.malloc(1024)
+        if buf is None:
+            return "data"
+        viperlib.snprintf(buf, 1024, "%s/data", self.exe_dir())
+        return buf
+
+    def data_dir(self) -> str:
+        s: str = self.EditDataDir.text()
+        if s is None or string.strlen(s) == 0:
+            s = self.default_data_dir()
+        return s
+
+    def default_model_path(self) -> str:
+        """默认模型路径 = <数据目录>/mnist.bin
+
+        必须给绝对路径：默认值曾经是裸文件名 "mnist.bin"，会被按进程 CWD 解析——
+        从 Qt bin 目录启动时模型就存/读到了 D:\\Qt\\...\\bin 而不是 exe 同目录的 data。
+        """
+        buf: str = stdlib.malloc(1024)
+        if buf is None:
+            return "mnist.bin"
+        viperlib.snprintf(buf, 1024, "%s/mnist.bin", self.data_dir())
+        return buf
+
+    def check_data(self) -> int:
+        """检测数据完整性, 刷新状态标签与按钮可用性; 返回缺失掩码"""
+        d: str = self.data_dir()
+        m: int = MnistData.data_missing_mask(d)
+        self.Mask = int(m)
+        txt: str = stdlib.malloc(256)
+        if txt is not None:
+            MnistData.missing_text(m, txt, sizet(256))
+            if m == 0:
+                self.LblDataState.setText(f"数据目录 {d}  ✓ {txt}")
+                self.LblDataState.setStyleSheet("color:#5fd06a;")
+            else:
+                self.LblDataState.setText(f"数据目录 {d}  ✗ {txt}")
+                self.LblDataState.setStyleSheet("color:#ffbe46;")
+            stdlib.free(txt)
+        if self.BtnDownload is not None:
+            if m == 0:
+                self.BtnDownload.setEnabled(0)
+            else:
+                self.BtnDownload.setEnabled(1)
+        return m
+
+    def on_pick_dir(self):
+        cur: str = self.data_dir()
+        old_default_model: str = f"{cur}/mnist.bin"
+        # parent 传 None: 形参注解是 "QWidget | None", 传 QMainWindow 包装对象
+        # 会触发注解类型不匹配; 传 None 是工程内已验证写法(ViperQtProject)。
+        p: str = vqt6.QFileDialog.getExistingDirectory(
+            None, "选择 MNIST 数据目录", cur)
+        if p is None or string.strlen(p) == 0:
+            return
+        self.EditDataDir.setText(p)
+        # 模型路径若仍是自动默认值, 跟着数据目录一起挪; 用户手改过则保持不动
+        if string.strcmp(self.EditSave.text(), old_default_model) == 0:
+            self.EditSave.setText(f"{p}/mnist.bin")
+        self.log(f"[data] 数据目录: {p}")
+        self.check_data()
+
+    def on_download(self):
+        """联网补齐缺失项(只下缺的)"""
+        d: str = self.data_dir()
+        m: int = self.check_data()
+        if m == 0:
+            self.log("[data] 数据已完整, 无需下载")
+            return
+        self.log(f"[data] 联网下载缺失项到 {d} ...")
+        if (m & (MnistData.MISS_TRAIN_IM | MnistData.MISS_TRAIN_LB)) != 0:
+            if MnistData.ensure_mnist(d, 0, 1, None, None) != 0:
+                self.log("[data] 训练集下载失败")
+                self.check_data()
+                return
+        if (m & (MnistData.MISS_TEST_IM | MnistData.MISS_TEST_LB)) != 0:
+            if MnistData.ensure_mnist(d, 1, 1, None, None) != 0:
+                self.log("[data] 测试集下载失败")
+                self.check_data()
+                return
+        self.log("[data] 下载完成")
+        self.check_data()
+
+    def on_copy_link(self):
+        buf_im: str = stdlib.malloc(1024)
+        buf_lb: str = stdlib.malloc(1024)
+        MnistData.gz_urls(0, buf_im, buf_lb)
+        vqt6.clipboard_set_text(f"{buf_im}\n{buf_lb}")
+        self.log("[data] 下载链接已复制到剪贴板")
+        stdlib.free(buf_im)
+        stdlib.free(buf_lb)
+
+    def on_pick_local(self):
+        """选两个本地 .gz(先图像 idx3, 再标签 idx1)就地解压补齐; 绝不联网"""
+        d: str = self.data_dir()
+        p_im: str = vqt6.QFileDialog.getOpenFileName(
+            None, "选择 MNIST 图像 .gz (idx3, 如 train-images-idx3-ubyte.gz)",
+            d, "GZip (*.gz)")
+        if p_im is None or string.strlen(p_im) == 0:
+            self.log("[data] 已取消: 未选择图像文件")
+            return
+        p_lb: str = vqt6.QFileDialog.getOpenFileName(
+            None, "选择 MNIST 标签 .gz (idx1, 如 train-labels-idx1-ubyte.gz)",
+            d, "GZip (*.gz)")
+        if p_lb is None or string.strlen(p_lb) == 0:
+            self.log("[data] 已取消: 未选择标签文件")
+            return
+        self.LocalIm = p_im
+        self.LocalLb = p_lb
+        self.LblLocal.setText(f"本地图像: {p_im}\n本地标签: {p_lb}")
+        self.log(f"[data] 本地图像: {p_im}")
+        self.log(f"[data] 本地标签: {p_lb}")
+        # 由文件名判定这对 .gz 属于哪一组(t10k-* 为测试集, 其余按训练集)
+        use_test: int = 0
+        if string.strstr(p_im, "t10k") is not None:
+            use_test = 1
+            self.log("[data] 按测试集(t10k)解压 ...")
+        else:
+            self.log("[data] 按训练集(train)解压 ...")
+        if MnistData.ensure_pair(d, use_test, p_im, p_lb) != 0:
+            self.log("[data] 本地解压失败(缺哪个文件见控制台输出)")
+            self.check_data()
+            return
+        self.log("[data] 本地文件解压完成")
+        self.check_data()
+
+    # ========================================================
+    # 训练: 准备 + 后台线程 + 轮询
+    # ========================================================
+    def on_arch_changed(self):
+        """架构单选变化: 记录选择并切换 conv 通道输入框可用性
+
+        toggled 在互斥组里会触发两次(取消的那个 + 选中的那个), 用 ArchSel 去重。
+        """
+        want: int = MnistNet.ARCH_MLP
+        if self.RbCnn.isChecked() != 0:
+            want = MnistNet.ARCH_CNN
+        if want == self.ArchSel:
+            return
+        self.ArchSel = want
+        if want == MnistNet.ARCH_CNN:
+            self.SpC1.setEnabled(1)
+            self.SpC2.setEnabled(1)
+            self.log("[net] 架构切换: CNN (卷积 + 池化)")
+        else:
+            self.SpC1.setEnabled(0)
+            self.SpC2.setEnabled(0)
+            self.log("[net] 架构切换: MLP (全连接)")
+
+    def prep_train_data(self, d: str, limit: sizet) -> int:
+        if self.XBuf is not None:
+            stdlib.free(self.XBuf)
+            self.XBuf = None
+        if self.YBuf is not None:
+            stdlib.free(self.YBuf)
+            self.YBuf = None
+        cap: sizet = sizet(60000)
+        if limit > 0 and limit < cap:
+            cap = limit
+        p_im: str = stdlib.malloc(1024)
+        p_lb: str = stdlib.malloc(1024)
+        MnistData.idx_paths(d, 0, p_im, p_lb)
+        self.XBuf = stdlib.malloc(cap * MnistData.N_IN * 8)
+        self.YBuf = stdlib.malloc(cap * 4)
+        if self.XBuf is None or self.YBuf is None:
+            self.log("[train] 数据缓冲分配失败")
+            return 1
+        n_im: sizet = MnistData.load_mnist_images(p_im, self.XBuf, cap)
+        n_lb: sizet = MnistData.load_mnist_labels(p_lb, self.YBuf, cap)
+        self.NTrain = n_im
+        if n_lb < self.NTrain:
+            self.NTrain = n_lb
+        stdlib.free(p_im)
+        stdlib.free(p_lb)
+        if self.NTrain == 0:
+            self.log("[train] 未找到可用数据(可点“联网下载缺失”或“选择本地 .gz(图像+标签)”)")
+            return 1
+        self.log(f"[train] 训练样本 {self.NTrain} 张")
+        return 0
+
+    def setup_net(self, hidden: sizet, arch: int,
+                  c1: sizet, c2: sizet) -> int:
+        """重置内存池后重建网络(改 hidden/架构/通道都干净重来), 并重建 3D 图数据"""
+        if self.Net is not None and self.Hidden == hidden \
+                and self.CurArch == arch and self.CurC1 == c1 \
+                and self.CurC2 == c2:
+            return 0
+        if self.Mark != 0:
+            self.Pool.reset_to(self.Mark)
+        self.Net = MnistNet.Net(self.Pool, hidden, sizet(arch), c1, c2)
+        if MnistNet.net_ok(self.Net) == 0:
+            self.log("[net] 网络分配失败")
+            return 1
+        MnistNet.init_net_weights(self.Net)
+        self.Hidden = hidden
+        self.CurArch = arch
+        self.CurC1 = c1
+        self.CurC2 = c2
+
+        # 3D 图: 输入抽稀(8x8) -> 隐藏 -> 输出
+        # CNN 的顶层规模也是 hidden -> 10, 故两种架构共用同一套图层设置
+        self.Sizes = stdlib.malloc(12)
+        sb: int* = self.Sizes
+        sb[0] = int(GR_IN)
+        sb[1] = int(hidden)
+        sb[2] = int(MnistData.N_OUT)
+        self.Graph.setup(self.Sizes, 3)
+        self.EdgeN = MnistNet.graph_edge_count(hidden)
+        if self.Edges is not None:
+            stdlib.free(self.Edges)
+        self.Edges = stdlib.malloc(self.EdgeN * 8)
+        MnistNet.graph_edges_for(self.Net, self.Edges)
+        self.Graph.setEdgeWeights(self.Edges, int(self.EdgeN))
+        self.Graph.setAllLayerAlpha(double(1.0))
+
+        node_n: sizet = sizet(GR_IN) + hidden + MnistData.N_OUT
+        if self.Nodes is not None:
+            stdlib.free(self.Nodes)
+        self.Nodes = stdlib.malloc(node_n * 8)
+        if self.HiddenBuf is not None:
+            stdlib.free(self.HiddenBuf)
+        self.HiddenBuf = stdlib.malloc(hidden * 8)
+        if self.Probs is not None:
+            stdlib.free(self.Probs)
+        self.Probs = stdlib.malloc(10 * 8)
+        if self.TargetProbs is not None:
+            stdlib.free(self.TargetProbs)
+        self.TargetProbs = stdlib.malloc(10 * 8)
+        an: str = MnistNet.arch_name(arch)
+        self.log(f"[net] 架构: {an}  结构: 64 -> {hidden} -> 10  (边 {self.EdgeN} 条)")
+        return 0
+
+    def on_start_train(self):
+        if self.Training != 0:
+            return
+        d: str = self.data_dir()
+        # 本地 .gz 已在 on_pick_local 选择时解压完成; 这里只做可用性检查:
+        # 既不擅自联网, 也不再拿本地文件去填另一组(否则会把 t10k 写进 train)。
+        if MnistData.ensure_mnist(d, 0, 0, None, None) != 0:
+            self.log("[train] 训练集未就绪: 请点“联网下载缺失”或“选择本地 .gz(图像+标签)”")
+            self.check_data()
+            return
+        self.CurEpochs = int(self.SpEpochs.value())
+        self.CurBatch = int(self.SpBatch.value())
+        hidden: sizet = sizet(self.SpHidden.value())
+        limit: sizet = sizet(self.SpLimit.value())
+        self.Seed = int(self.SpSeed.value())
+        self.SavePath = self.EditSave.text()
+        self.CurAug = int(self.ChkAug.isChecked())
+        self.CurLr = MnistData.atof(self.EditLr.text(), double(0.01))
+        if self.CurLr <= double(0.0):
+            self.CurLr = double(0.01)
+        # 架构与通道: MLP 下通道无意义, 统一传 0(避免残留上次的 CNN 通道值)
+        arch: int = self.ArchSel
+        c1: sizet = 0
+        c2: sizet = 0
+        if arch == MnistNet.ARCH_CNN:
+            c1 = sizet(self.SpC1.value())
+            c2 = sizet(self.SpC2.value())
+
+        if self.prep_train_data(d, limit) != 0:
+            return
+        if self.setup_net(hidden, arch, c1, c2) != 0:
+            return
+        MnistNet.prog_init()
+        MnistNet.rand_seed(uint64(self.Seed))
+        torch.manual_seed(int64(self.Seed))
+
+        self.Chart.clearAll()
+        self.ChartSynced = 0
+        self.ChartSyncedVal = 0
+        self.Pbar.setValue(0)
+        self.LblTrainInfo.setText("训练中 ...")
+        self.BtnTrain.setEnabled(0)
+        self.BtnStop.setEnabled(1)
+        self.Training = 1
+        th: vthreading.Thread* = vthreading.Thread(WorkerTrain, t.CPtr(0))
+        th.start()
+        self.ThreadH = th.handle      # 帧内取出句柄, 之后不再持 Thread 对象
+        self.TimerPoll.start(120)
+        aug_txt: str = "关"
+        if self.CurAug != 0:
+            aug_txt = "开"
+        an2: str = MnistNet.arch_name(arch)
+        self.log(f"[train] 启动: 架构={an2} epochs={self.CurEpochs} "
+                 f"batch={self.CurBatch} lr={self.CurLr} 增强={aug_txt}")
+
+    def worker_train(self):
+        """后台线程: 训练并写进度总线(不触碰任何 Qt 对象)"""
+        MnistNet.train_run(self.Pool, self.Net, self.XBuf, self.YBuf, self.NTrain,
+                           sizet(self.CurBatch), sizet(self.CurEpochs),
+                           self.CurLr, self.SavePath, self.CurAug)
+
+    def on_stop_train(self):
+        MnistNet.prog_stop = 1
+        self.log("[train] 已请求停止(当前 step 结束后退出)")
+
+    def on_zoom_chart(self):
+        """另开一个大窗查看当前曲线(复制一份数据, 关闭即销毁)"""
+        self.Chart.openZoom("ViperMNIST 训练曲线")
+
+    def on_poll_training(self):
+        """主线程轮询: 同步曲线点、进度条、日志; 结束则收尾"""
+        pt: double* = stdlib.malloc(24)
+        while self.ChartSynced < MnistNet.prog_n:
+            if MnistNet.prog_point(self.ChartSynced, pt) == 0:
+                break
+            sx: double* = pt
+            self.Chart.append(self.LineLoss, sx[0], sx[1])
+            self.Chart.append(self.LineAcc, sx[0], sx[2])
+            self.ChartSynced += 1
+        # 验证集曲线(每 epoch 一个点, 数量少且 x 稀疏)
+        while self.ChartSyncedVal < MnistNet.prog_vn:
+            if MnistNet.prog_val_point(self.ChartSyncedVal, pt) == 0:
+                break
+            sx = pt
+            self.Chart.append(self.LineValLoss, sx[0], sx[1])
+            self.Chart.append(self.LineValAcc, sx[0], sx[2])
+            self.ChartSyncedVal += 1
+        stdlib.free(pt)
+        self.Chart.autoscale()
+        self.Chart.syncZoom()      # 大窗开着就跟着刷新(关着时什么也不做)
+
+        tot: int = MnistNet.prog_total
+        cur: int = MnistNet.prog_step
+        if tot > 0:
+            v: int = cur * 1000 / tot
+            if v > 1000:
+                v = 1000
+            self.Pbar.setValue(int(v))
+            self.LblTrainInfo.setText(
+                f"epoch {MnistNet.prog_epoch}/{MnistNet.prog_epochs}  step {cur}/{tot}")
+        if MnistNet.prog_done == 0:
+            return
+        # 收尾
+        self.TimerPoll.stop()
+        self.Training = 0
+        self.BtnTrain.setEnabled(1)
+        self.BtnStop.setEnabled(0)
+        if MnistNet.prog_fail != 0:
+            self.LblTrainInfo.setText("训练失败")
+            self.log("[train] 失败")
+            return
+        self.Pbar.setValue(1000)
+        self.LblTrainInfo.setText("训练完成")
+        self.log("[train] 完成")
+        # 权重已更新 → 刷新 3D 图的边权重
+        if self.Net is not None and self.Edges is not None:
+            MnistNet.graph_edges_for(self.Net, self.Edges)
+            self.Graph.setEdgeWeights(self.Edges, int(self.EdgeN))
+        if vthreading.wait_handle(self.ThreadH, ULONG(2000)) != 0:
+            vthreading.close_handle(self.ThreadH)
+            self.ThreadH = None
+
+    def on_load_model(self):
+        # 起始目录给数据目录(而不是 "")：空串会从进程 CWD 起, 从 Qt bin 目录
+        # 启动时会落到 D:\Qt\...\bin
+        p: str = vqt6.QFileDialog.getOpenFileName(
+            None, "选择模型文件", self.data_dir(), "ViperMNIST model (*.bin);;All (*)")
+        if p is None or string.strlen(p) == 0:
+            return
+        # 先读文件头: 架构/hidden/通道以文件为准, 自动把界面切过去再建网
+        # (否则用户得自己先对齐 hidden 和架构才能加载, 报错还很绕)
+        info: int* = stdlib.malloc(20)
+        if info is None:
+            return
+        if MnistNet.peek_model(p, info) == 0:
+            stdlib.free(info)
+            self.log("[model] 非 ViperMNIST 模型文件或读取失败")
+            return
+        f_arch: int = info[0]
+        f_hidden: int = info[1]
+        f_c1: int = info[2]
+        f_c2: int = info[3]
+        stdlib.free(info)
+
+        if f_arch == MnistNet.ARCH_CNN:
+            self.RbCnn.setChecked(1)
+        else:
+            self.RbMlp.setChecked(1)
+        self.on_arch_changed()
+        self.SpHidden.setValue(f_hidden)
+        c1: sizet = 0
+        c2: sizet = 0
+        if f_arch == MnistNet.ARCH_CNN:
+            self.SpC1.setValue(f_c1)
+            self.SpC2.setValue(f_c2)
+            c1 = sizet(f_c1)
+            c2 = sizet(f_c2)
+        hidden: sizet = sizet(f_hidden)
+        if self.setup_net(hidden, f_arch, c1, c2) != 0:
+            return
+        if MnistNet.load_model(self.Net, p) != 0:
+            self.log("[model] 加载失败")
+            return
+        self.EditSave.setText(p)
+        self.LblTop.setText("模型已加载, 可以手写或加载测试样本")
+        an3: str = MnistNet.arch_name(f_arch)
+        self.log(f"[model] 已加载: {p}  ({an3}, hidden={f_hidden})")
+        MnistNet.graph_edges_for(self.Net, self.Edges)
+        self.Graph.setEdgeWeights(self.Edges, int(self.EdgeN))
+
+    # ========================================================
+    # 推理页动作
+    # ========================================================
+    def file_size_of(self, path: str) -> sizet:
+        f: fileio.File* = fileio.File(path, fileio.MODE.R)
+        if f.closed:
+            return 0
+        sz: LONGLONG = f.size()
+        f.close()
+        return sizet(sz)
+
+    def ensure_test_data(self, d: str) -> int:
+        """惰性加载 t10k 原始 IDX 字节(供“加载测试样本”)"""
+        if self.TestRaw is not None:
+            return 0
+        if MnistData.ensure_mnist(d, 1, 0, None, None) != 0:
+            return 1
+        p_im: str = stdlib.malloc(1024)
+        p_lb: str = stdlib.malloc(1024)
+        MnistData.idx_paths(d, 1, p_im, p_lb)
+        self.TestRaw = MnistData.read_file_all(p_im, self.file_size_of(p_im))
+        self.TestLbl = MnistData.read_file_all(p_lb, self.file_size_of(p_lb))
+        stdlib.free(p_im)
+        stdlib.free(p_lb)
+        if self.TestRaw is None or self.TestLbl is None:
+            return 1
+        self.TestN = sizet(MnistData.be32(self.TestRaw, 4))
+        return 0
+
+    def on_pick_sample(self):
+        d: str = self.data_dir()
+        if self.ensure_test_data(d) != 0:
+            self.log("[infer] 测试集不可用(可先“下载数据”或指定本地 .gz)")
+            return
+        idx: sizet = MnistNet.rand_idx(self.TestN)
+        lb: uchar* = self.TestLbl
+        src: t.CPtr = self.TestRaw + 16 + idx * MnistData.N_IN
+        string.memcpy(self.Sample28, src, MnistData.N_IN)
+        self.HaveSample = 1
+        self.Canvas.setImage28(self.Sample28)
+        real: int = int(lb[8 + idx])
+        self.LblTop.setText(f"已加载测试样本 #{idx}, 真实标签 = {real}")
+        self.log(f"[infer] 测试样本 #{idx} 真实={real}")
+
+    def on_clear_canvas(self):
+        self.HaveSample = 0
+        self.Canvas.clear()
+        self.Canvas.setScanLine(-1)
+        self.LblResult.setText("?")
+        self.LblTop.setText("已清空")
+        for i in range(10):
+            self.bar_at(i).setValue(0)
+
+    def on_canvas_changed(self):
+        self.HaveSample = 0
+        self.Canvas.setScanLine(-1)
+        self.LblTop.setText("笔迹已更新, 点“识别”开始")
+
+    def on_use(self):
+        """识别 + 启动逐层点亮动画"""
+        if self.Net is None or self.Hidden == 0:
+            self.LblTop.setText("请先训练或加载模型")
+            return
+        has: int = int(self.Canvas.toMnist28(self.Img28))
+        if has == 0 and self.HaveSample != 0:
+            string.memcpy(self.Img28, self.Sample28, MnistData.N_IN)
+            has = 1
+        if has == 0:
+            self.LblTop.setText("画布为空, 请先手写或加载测试样本")
+            return
+        # 前向: 概率 + hidden 激活(按架构分派: MLP / CNN)
+        best: int = MnistNet.predict_net(
+            self.Net, self.Img28, self.Probs, self.HiddenBuf)
+        if best < 0:
+            self.LblTop.setText("推理失败")
+            return
+        # 组装 3D 节点值: 输入抽稀(8x8) + 隐藏(按最大值归一) + 输出概率
+        MnistNet.downsample_8x8(self.Img28, self.Nodes)
+        hv: double* = self.HiddenBuf
+        mx: double = double(1e-9)
+        for k in range(self.Hidden):
+            if hv[k] > mx:
+                mx = hv[k]
+        nb: double* = self.Nodes
+        for k in range(self.Hidden):
+            nb[sizet(GR_IN) + k] = hv[k] / mx
+        pb: double* = self.Probs
+        for ci in range(MnistData.N_OUT):
+            nb[sizet(GR_IN) + self.Hidden + ci] = pb[ci]
+        self.Graph.setValues(self.Nodes,
+                             int(sizet(GR_IN) + self.Hidden + MnistData.N_OUT))
+        self.Graph.setAllLayerAlpha(double(0.05))
+
+        # 概率条目标值拷贝(动画里逐步逼近)
+        tb: double* = self.TargetProbs
+        for ci in range(MnistData.N_OUT):
+            tb[ci] = pb[ci]
+        for i in range(10):
+            self.bar_at(i).setValue(0)
+
+        # 文案: 折成三行 —— 预测：/ 主选：(best) / 次选：(第 2、3、4 名)
+        # 概率条本身只显示整数百分比, 这里给带小数的明细。
+        # 注意 r1 就是 argmax(与 best 同值), 列进次选会重复, 故次选从 r2 起。
+        r1: int = self.top_index(pb, -1, -1)
+        r2: int = self.top_index(pb, r1, -1)
+        r3: int = self.top_index(pb, r1, r2)
+        r4: int = self.top_index(pb, r1, r2, r3)
+        self.LblResult.setText(f"{best}")
+        self.LblTop.setText(
+            f"预测：\n"
+            f"主选：{best} = {pb[best] * 100.0:.1f}%\n"
+            f"次选：{r2}={pb[r2] * 100.0:.2f}%  {r3}={pb[r3] * 100.0:.2f}%  "
+            f"{r4}={pb[r4] * 100.0:.2f}%")
+
+        # 启动动画
+        self.AnimPhase = 0
+        self.AnimT = 0
+        self.Canvas.setScanLine(0)
+        self.TimerAnim.start(25)
+
+    def on_anim_tick(self):
+        """逐层点亮动画: 扫描线 → 输入层 → 隐藏层 → 输出层 → 概率条长高"""
+        ph: int = self.AnimPhase
+        frac: double = double(self.AnimT) / double(ANIM_SPAN)
+
+        if ph == 0:
+            self.Canvas.setScanLine(int(frac * 1000.0))
+        elif ph == 1:
+            self.Canvas.setScanLine(-1)
+            self.Graph.setLayerAlpha(0, frac)
+        elif ph == 2:
+            self.Graph.setLayerAlpha(1, frac)
+        elif ph == 3:
+            self.Graph.setLayerAlpha(2, frac)
+        elif ph == 4:
+            pb: double* = self.TargetProbs
+            for i in range(10):
+                self.bar_at(i).setValue(int(pb[i] * frac * 1000.0))
+        self.AnimT = self.AnimT + 1
+        if self.AnimT > ANIM_SPAN:
+            self.AnimT = 0
+            self.AnimPhase = ph + 1
+            if self.AnimPhase > 4:
+                self.TimerAnim.stop()
+                pb2: double* = self.TargetProbs
+                for i2 in range(10):
+                    self.bar_at(i2).setValue(int(pb2[i2] * 1000.0))
+                self.Graph.setAllLayerAlpha(double(1.0))
+
+
+# ============================================================
+# 单例 + 回调跳板(Qt 只接受裸函数指针, 这里转发到实例方法)
+# ============================================================
+_g_ui: AppGui*
+
+
+def CbDownload(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_download()
+
+
+def CbCopyLink(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_copy_link()
+
+
+def CbPickDir(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_pick_dir()
+
+
+def CbCheckData(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.check_data()
+
+
+def CbPickLocal(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_pick_local()
+
+
+def CbArchChanged(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_arch_changed()
+
+
+def CbStartTrain(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_start_train()
+
+
+def CbStopTrain(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_stop_train()
+
+
+def CbZoomChart(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_zoom_chart()
+
+
+def CbPollTraining(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_poll_training()
+
+
+def CbLoadModel(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_load_model()
+
+
+def CbPickSample(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_pick_sample()
+
+
+def CbClearCanvas(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_clear_canvas()
+
+
+def CbCanvasChanged(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_canvas_changed()
+
+
+def CbUse(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_use()
+
+
+def CbAnimTick(slot_id: int, data: t.CPtr):
+    if _g_ui is not None:
+        _g_ui.on_anim_tick()
+
+
+def WorkerTrain(arg: t.CPtr) -> t.CPtr:
+    """后台训练线程入口"""
+    if _g_ui is not None:
+        _g_ui.worker_train()
+    return None
+
+
+# ============================================================
+# 入口
+# ============================================================
+def run(pool: memhub.MemBuddy*) -> int:
+    """创建面板单例并进入 Qt 事件循环"""
+    global _g_ui
+    _g_ui = AppGui(pool)
+    return _g_ui.exec()

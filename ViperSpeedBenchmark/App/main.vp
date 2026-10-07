@@ -1,0 +1,387 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# ViperSpeedBenchmark - Viper(vipersimd) 进程内多次 run 基准实现
+#
+# 内核(与 bench_c.c / bench_cpp.cpp / bench_py.py 一致):
+#   out[i] = a[i] * b[i] + c[i]     i = 0 .. LEN-1, LEN = 16384 (double)
+#
+# 每次计时 run = ITERS = 65536 趟内核, 单趟 2 次浮点运算/元素,
+# 总 flops = LEN*ITERS*2 ≈ 2.147e9(与 C/C++/Python 完全同规模)。
+#
+# SIMD 实现: vipersimd.simd_fma_array —— 单趟融合乘加批量内核
+#   (×8 双缓冲 AVX2 ymm0-15, 每大迭代 16 路 load 在飞后 8 条
+#    vfmadd213pd 一次完成 out=a*b+c, 加数 c 直接用内存操作数)。
+#   vfmadd213pd 语义: ymmD = ymmS1*ymmD + mem(单次舍入, 真硬件 FMA)。
+#   因此不再有 mul→tmp→add 两遍写法的中间数组与 1.5 倍内存流量;
+#   由于是单次舍入, Viper 的逐元素结果(及 CHECK)与 C/C++/Python 的
+#   "先乘后加两次舍入"可能差 1ulp(各实现内自洽, README §1 已注明)。
+#
+# 命令行: app.exe [runs] [len] [iters] [mode]
+#   runs : 默认 1; 0 = 仅热身(不输出 RESULT)。由 run_bench.py 传 10。
+#   len  : 向量长度(4 的倍数, 默认 LEN)
+#   iters: 每 run 内核趟数(默认 ITERS)
+#   mode : 内核编号(见下方 KERNEL_* 常量), 默认 0 = FMA SIMD
+#          偶数 = SIMD(vipersimd.<op>_array) / 奇数 = 同操作的标量(原生)对照
+#          「SIMD vs Native」用同一个 exe、只切换 mode, 除向量化外无其它差异。
+#   命令行解析为自包含实现(GetCommandLineA 手工分词), 不依赖 sys/memhub。
+#
+# 流程(与其它实现一致):
+#   * 入口 OpenThread(GetCurrentThreadId()) 取真句柄, SetThreadAffinityMask 绑到
+#     首个可用逻辑核并提线程优先级, 打印 AFFINITY <core>;
+#   * 进程开头打印一次 CFG <len> <iters>;
+#   * 分配 a/b/c/out 并用固定种子 LCG 填充 a/b/c(不计时);
+#   * 2 轮满负荷热身(每轮 = ITERS 趟内核 + 升序读回 out 求校验和);
+#   * 连续计时 runs 次, 每次 RESULT <wall_us> <cpu_us> <flops>;
+#   * 全部结束后 CHECK <sum>(最后一次 run 的 out 升序累加)。
+# 双计时只包住 ITERS 趟内核本身:
+#   wall_us = QPC 墙钟微秒(含被抢占 / 被降频的时间, 对调度敏感);
+#   cpu_us  = QueryThreadCycleTime 本线程消耗的 CPU 周期数换算成微秒
+#             (只计真正执行过的周期, 对抢占 / 降频不敏感);
+#             TSC 频率在入口用 QPC 标定(三次 30ms 忙等取最大), 并打印 TSC <hz>。
+#   不用 GetThreadTimes: 其记账粒度跟随调度时钟节拍(实测硬地板 15.625ms),
+#   几十毫秒的 run 误差 ±40%, 且 Win10 2004+ 无法用 timeBeginPeriod 改善。
+# ============================================================
+from stdint import *
+import vipersimd
+import vipermath
+import stdlib
+import stdio
+import t
+
+# 内核编号(命令行第 4 个参数): 只决定"跑哪份内核", 不影响计时/统计逻辑。
+# 成对编号 = 同一操作的 SIMD 与标量(原生)对照, 供 SIMD 加速比测量:
+#   0 / 1 = FMA   out = a*b + c   —— 与 C/C++/Python 对齐的主内核
+#   2 / 3 = ADD   out = a + b
+#   4 / 5 = MUL   out = a * b
+#   6 / 7 = SQRT  out = sqrt(a)
+# 偶数 = SIMD(vipersimd.<op>_array), 奇数 = 标量(vipersimd.scalar_<op>_array)。
+# 标量版用的是对应标量指令(vaddsd/vmulsd/vsqrtsd/vfmadd213sd), 与 SIMD 版
+# 数学等价、逐位同结果, 因此两边的 CHECK 可直接对照。
+define KERNEL_FMA_SIMD = 0
+define KERNEL_FMA_SCALAR = 1
+define KERNEL_ADD_SIMD = 2
+define KERNEL_ADD_SCALAR = 3
+define KERNEL_MUL_SIMD = 4
+define KERNEL_MUL_SCALAR = 5
+define KERNEL_SQRT_SIMD = 6
+define KERNEL_SQRT_SCALAR = 7
+define KERNEL_MAX = 7       # 合法 mode 上界
+
+# 向量长度(4 的倍数, 满足 vipersimd 批量内核按 4 个 double 分批)
+# 负载约束: LEN × ITERS × 2 恒为 ≈2.147e9 flops/run(与 C/C++/Python 可比),
+# 只调 LEN 改"工作集": LEN=16384 -> 四份共 512 KiB, 稳居本机每核 1 MiB 私有 L2。
+define LEN = 16384
+define ITERS = 65536       # 每 run 内核趟数
+define RUNS_MAX = 200      # runs 上限
+
+# 伪随机 LCG 参数(minstd / Park-Miller), 固定种子 -> 可复现
+define LCG_A = 48271.0
+define LCG_M = 2147483647.0
+define LCG_SEED = 12345.0
+
+# Win32 常量
+define THREAD_ALL_ACCESS = 0x1FFFFF      # OpenThread 权限(足够绑亲和 + 查周期)
+define THREAD_PRIORITY_HIGHEST = 2       # SetThreadPriority 档位
+
+
+# extern: Win32 高精度计时 (kernel32, 由 project.vpj 的 -lkernel32 链接)
+def QueryPerformanceCounter(lpPerformanceCount: t.CPtr) -> int | t.CExtern: pass
+def QueryPerformanceFrequency(lpFrequency: t.CPtr) -> int | t.CExtern: pass
+# extern: 原始命令行(整行, 含程序路径), 用于自解析第 1 个参数
+def GetCommandLineA() -> CHARPTR | t.CExtern: pass
+# extern: 线程绑定 / 线程 CPU 周期(kernel32, 由 project.vpj 的 -lkernel32 链接)
+# 关键: 不要用 GetCurrentThread() —— 它返回伪句柄 (HANDLE)-2, 是个"负指针",
+# 在 Viper 的 t.CPtr 语义下未必能原样传给 C(实测 QueryThreadCycleTime 只会
+# 写回一次调用开销 ~0.23us 的量级)。改用 GetCurrentThreadId() + OpenThread()
+# 拿一个真正的、纯数值的句柄, 全程用 t.CSizeT 表达, 彻底绕开指针/NULL 语义。
+def GetCurrentThreadId() -> sizet | t.CExtern: pass
+def OpenThread(dwDesiredAccess: sizet, bInheritHandle: int, dwThreadId: sizet) -> sizet | t.CExtern: pass
+def SetThreadAffinityMask(hThread: sizet, dwThreadAffinityMask: sizet) -> sizet | t.CExtern: pass
+def SetThreadPriority(hThread: sizet, nPriority: int) -> int | t.CExtern: pass
+def QueryThreadCycleTime(hThread: sizet, CycleTime: t.CPtr) -> int | t.CExtern: pass
+
+
+# ------------------------------------------------------------
+# 自包含命令行解析: 取第 idx 个整数参数(idx 从 0 起, 0 号是 runs)。
+# 分词规则: 先跳过程序路径(容忍引号), 之后每个空白分隔的 token 记作一个参数;
+# token 里的十进制数字即该参数值, 缺失/非数字则返回 def_val。
+#   命令行: app.exe [runs] [len] [iters]
+# ------------------------------------------------------------
+def cmdline_int(idx: int, def_val: int64) -> int64:
+    cmd: CHARPTR = GetCommandLineA()
+    if cmd is None:
+        return def_val
+    i: sizet = 0
+    # 跳过前导空白
+    while cmd[i] == 32 or cmd[i] == 9:
+        i += 1
+    # 跳过第 0 个 token(程序路径; 可能带引号)
+    if cmd[i] == 34:
+        i += 1
+        while cmd[i] != 0 and cmd[i] != 34:
+            i += 1
+        if cmd[i] == 34:
+            i += 1
+    else:
+        while cmd[i] != 0 and cmd[i] != 32 and cmd[i] != 9:
+            i += 1
+    # 逐个 token 往后找第 idx 个参数
+    for cur in range(idx + 1):
+        while cmd[i] == 32 or cmd[i] == 9:
+            i += 1
+        if cmd[i] == 0:
+            return def_val
+        # 读十进制整数(可空, 用 seen 区分 0 与"没有数字")
+        val: int64 = 0
+        seen: int = 0
+        while cmd[i] >= 48 and cmd[i] <= 57:
+            val = val * 10 + int64(cmd[i] - 48)
+            i += 1
+            seen = 1
+        if cur == idx:
+            if seen == 1:
+                return val
+            return def_val
+        # 跳过本 token 剩余字符(保证每轮至少前进一个字符, 不会死循环)
+        while cmd[i] != 0 and cmd[i] != 32 and cmd[i] != 9:
+            i += 1
+    return def_val
+
+
+# ------------------------------------------------------------
+# 填充 a/b/c: 逐元素依次消耗同一个 LCG 流(a[i], b[i], c[i])
+# 迭代顺序与 C/C++/Python 完全一致, 保证输入逐位相同。
+# ------------------------------------------------------------
+def fill_abc(a: t.CPtr, b: t.CPtr, c: t.CPtr, n: sizet):
+    da: double* = a
+    db: double* = b
+    dc: double* = c
+    state: double = double(LCG_SEED)
+    m: double = double(LCG_M)
+    mul: double = double(LCG_A)
+    for i in range(n):
+        state = vipermath.fmod(state * mul, m)
+        da[i] = state / m
+        state = vipermath.fmod(state * mul, m)
+        db[i] = state / m
+        state = vipermath.fmod(state * mul, m)
+        dc[i] = state / m
+
+
+# 校验和: 升序逐元素累加 out(与其它语言顺序一致; 读回保证写不被优化)
+def checksum_sum(out: t.CPtr, n: sizet) -> double:
+    dout: double* = out
+    s: double = double(0.0)
+    for i in range(n):
+        s += dout[i]
+    return s
+
+
+# ------------------------------------------------------------
+# 连续跑 iters 趟内核(热身与计时都走这里, 保证两边完全同一条路径)。
+# mode 选内核(见顶部 KERNEL_*): 偶数 = SIMD, 奇数 = 同操作的标量(原生)对照。
+# 分派用等值判断链而非函数指针: 每趟多一次分支, 相对"一趟内核"(微秒级)可忽略;
+# 且所有 mode 共用同一个调用点, 不会因代码布局差异污染 SIMD/原生对照。
+# mode 已在 main 入口校验为 0..KERNEL_MAX, 所以最后一个 else 必然落在
+# KERNEL_SQRT_SCALAR 上(与 else-if 链等价, 不是"兜底")。
+# ------------------------------------------------------------
+def run_iters(a: t.CPtr, b: t.CPtr, cbuf: t.CPtr, out: t.CPtr,
+              n: sizet, iters: sizet, mode: int):
+    for k in range(iters):
+        if mode == int(KERNEL_FMA_SIMD):
+            vipersimd.simd_fma_array(a, b, cbuf, out, n)
+        elif mode == int(KERNEL_FMA_SCALAR):
+            vipersimd.scalar_fma_array(a, b, cbuf, out, n)
+        elif mode == int(KERNEL_ADD_SIMD):
+            vipersimd.simd_add_array(a, b, out, n)
+        elif mode == int(KERNEL_ADD_SCALAR):
+            vipersimd.scalar_add_array(a, b, out, n)
+        elif mode == int(KERNEL_MUL_SIMD):
+            vipersimd.simd_mul_array(a, b, out, n)
+        elif mode == int(KERNEL_MUL_SCALAR):
+            vipersimd.scalar_mul_array(a, b, out, n)
+        elif mode == int(KERNEL_SQRT_SIMD):
+            vipersimd.simd_sqrt_array(a, out, n)
+        else:
+            vipersimd.scalar_sqrt_array(a, out, n)
+
+
+# 读取 8 字节有符号 64 位整数(有符号 64 位)
+# 既用于 QPC 写入的 LARGE_INTEGER.QuadPart, 也用于 QueryThreadCycleTime 写回的 ULONG64。
+# 计时换算走纯 i64 整数路径: us = (dt * 1000000) / freq, 避免浮点表达式的低级错误
+def qpc_ticks(p: t.CPtr) -> int64:
+    v: INT64PTR = p
+    return v[0]
+
+
+# ------------------------------------------------------------
+# 打开当前线程的"真句柄"(失败返回 0)。不要用 GetCurrentThread(): 它返回
+# 伪句柄 (HANDLE)-2(负指针), 在 Viper 的 t.CPtr 语义下传递不可靠。
+# 进程退出时系统回收, 这里不显式 CloseHandle。
+# ------------------------------------------------------------
+def open_own_thread() -> sizet:
+    return OpenThread(sizet(THREAD_ALL_ACCESS), int(0), GetCurrentThreadId())
+
+
+# ------------------------------------------------------------
+# 线程绑定: 绑到"第一个可用逻辑核", 返回 CPU 序号; 失败返回 -1。
+# 用 mask = 1, 2, 4, 8 ... 逐个试: 第一个被系统接受的位就是进程亲和掩码里
+# 编号最小的核 —— 四个实现会绑到同一个核, 横向对比才有意义。
+# SetThreadAffinityMask 成功时返回"此前的掩码"(可能非 1), 失败返回 0。
+# ------------------------------------------------------------
+def bind_first_available_core(h: sizet) -> int:
+    mask: sizet = sizet(1)
+    for i in range(64):
+        if SetThreadAffinityMask(h, mask) != sizet(0):
+            return i
+        mask = mask * sizet(2)
+    return -1
+
+
+# ------------------------------------------------------------
+# 本线程累计消耗的 CPU 周期数(QueryThreadCycleTime 写回 cyc_buf, 8 字节)。
+# 现代 x86 的 TSC 是 invariant 的, 与核心实际频率无关, 所以"周期数"就是
+# "本线程真正在 CPU 上跑过的时间", 对抢占与降频都不敏感。
+# ------------------------------------------------------------
+def thread_cycles(h: sizet, cyc_buf: t.CPtr) -> int64:
+    QueryThreadCycleTime(h, cyc_buf)
+    return qpc_ticks(cyc_buf)
+
+
+# ------------------------------------------------------------
+# 用 QPC 标定 TSC 频率(周期/秒): 忙等 30ms 数周期, 重复 3 次取最大。
+# 为什么取最大: 标定窗口内本线程一旦被抢占, 消耗周期就少于墙钟流逝时间,
+# 算出 hz 偏小 -> 后续 cpu_us 系统性偏大(表现为"cpu_us 偶尔比 wall_us 还大"
+# 这种看着像 bug 的伪影)。取三次最大值 = 挑最没被打断的那一次。
+# 必须在绑核之后调用, 否则跨核的 TSC 可能不同步。返回 0 = 标定失败。
+# q0_buf/q1_buf 用于括住忙等窗口, cyc_buf 存周期数(都由调用方提供, 免重复分配)。
+# ------------------------------------------------------------
+def calibrate_tsc_hz(h: sizet, freq_i: int64, q0_buf: t.CPtr, q1_buf: t.CPtr, cyc_buf: t.CPtr) -> double:
+    best: double = double(0.0)
+    span_i: int64 = (freq_i * int64(30)) / int64(1000)   # 30ms 的 QPC 计次
+    for trial in range(3):
+        c0: int64 = thread_cycles(h, cyc_buf)
+        QueryPerformanceCounter(q0_buf)
+        dt: int64 = int64(0)
+        while dt < span_i:
+            QueryPerformanceCounter(q1_buf)
+            dt = qpc_ticks(q1_buf) - qpc_ticks(q0_buf)
+        c1: int64 = thread_cycles(h, cyc_buf)
+        if dt > int64(0) and c1 > c0:
+            hz: double = double(c1 - c0) * double(freq_i) / double(dt)
+            if hz > best:
+                best = hz
+    return best
+
+
+def main() -> int:
+    # 命令行: app.exe [runs] [len] [iters] [mode]; 省略则用顶部常量的默认值
+    runs_req: int64 = cmdline_int(0, int64(1))
+    n_req: int64 = cmdline_int(1, int64(LEN))
+    iters_req: int64 = cmdline_int(2, int64(ITERS))
+    mode_req: int64 = cmdline_int(3, int64(KERNEL_FMA_SIMD))
+    # 内核按 4-lane ymm 分批, LEN 必须是 4 的倍数; 参数非法直接报错, 不静默修正
+    if n_req < int64(4) or n_req % int64(4) != int64(0) or iters_req < int64(1):
+        stdio.printf("bad args: len=%d(需 >=4 且为 4 的倍数) iters=%d\n",
+                     int(n_req), int(iters_req))
+        return 2
+    # mode 越界直接报错退出, 避免"悄悄跑成别的内核"污染 SIMD/原生对照
+    if mode_req < int64(0) or mode_req > int64(KERNEL_MAX):
+        stdio.printf("bad args: mode=%d(只接受 0..7: FMA/ADD/MUL/SQRT 各一对 SIMD/原生)\n",
+                     int(mode_req))
+        return 2
+    if runs_req < int64(0):
+        runs_req = int64(0)
+    if runs_req > int64(RUNS_MAX):
+        runs_req = int64(RUNS_MAX)
+
+    n: sizet = sizet(n_req)
+    iters: sizet = sizet(iters_req)
+    mode: int = int(mode_req)          # 0=SIMD / 1=Scalar(已校验)
+    nb: sizet = n * sizet(8)
+    nruns: sizet = sizet(runs_req)
+
+    # 先拿当前线程的真句柄(失败就没法绑核/取周期, 直接报错退出, 不静默降级)
+    h_thread: sizet = open_own_thread()
+    if h_thread == sizet(0):
+        stdio.printf("OpenThread(GetCurrentThreadId()) failed\n")
+        return 1
+
+    # 线程绑定(必做) + 提优先级: 与 C/C++/Python 同口径, 并压低背景进程抢占的尖峰
+    core: int = bind_first_available_core(h_thread)
+    SetThreadPriority(h_thread, int(THREAD_PRIORITY_HIGHEST))
+
+    # 四块缓冲区 malloc(对齐由 stdlib 保证 16B 以上); 单趟内核不再需要 tmp
+    a: t.CPtr = stdlib.malloc(nb)
+    b: t.CPtr = stdlib.malloc(nb)
+    c: t.CPtr = stdlib.malloc(nb)
+    out: t.CPtr = stdlib.malloc(nb)
+    if not a or not b or not c or not out:
+        stdio.printf("malloc failed\n")
+        return 1
+
+    # 进程开头打印一次配置(其它实现同一协议: CFG <len> <iters> + AFFINITY <core>)
+    stdio.printf("CFG %d %d\n", int(n), int(iters))
+    stdio.printf("MODE %d\n", mode)
+    stdio.printf("AFFINITY %d\n", core)
+
+    # 输入生成一次(不计时)
+    fill_abc(a, b, c, n)
+
+    # QPC 频率/计次缓冲 + CPU 周期缓冲(均 == 8 字节)
+    freq_buf: t.CPtr = stdlib.malloc(sizet(8))
+    t0_buf: t.CPtr = stdlib.malloc(sizet(8))
+    t1_buf: t.CPtr = stdlib.malloc(sizet(8))
+    cyc_buf: t.CPtr = stdlib.malloc(sizet(8))
+    if not freq_buf or not t0_buf or not t1_buf or not cyc_buf:
+        stdio.printf("malloc failed\n")
+        return 1
+    QueryPerformanceFrequency(freq_buf)
+    freq_i: int64 = qpc_ticks(freq_buf)
+    if freq_i <= int64(0):
+        freq_i = int64(10000000)   # 兜底: 假设 10MHz(与实测一致)
+
+    # TSC 频率标定(必须在绑核之后): 把 QueryThreadCycleTime 的周期数换算成微秒
+    tsc_hz: double = calibrate_tsc_hz(h_thread, freq_i, t0_buf, t1_buf, cyc_buf)
+    stdio.printf("TSC %.4e\n", tsc_hz)
+
+    # 运算量用纯整数表示(展示/换算时才转 double), 绕开浮点表达式低级错误。
+    # 每元素浮点运算数: FMA = 2(乘+加), ADD / MUL / SQRT = 1。
+    ops_per_elem: int64 = int64(1)
+    if mode == int(KERNEL_FMA_SIMD) or mode == int(KERNEL_FMA_SCALAR):
+        ops_per_elem = int64(2)
+    total_i: int64 = int64(n) * int64(iters) * ops_per_elem
+
+    last_chk: double = double(0.0)
+
+    # 2 轮满负荷热身(每轮 = ITERS 趟内核 + 读回 out 求校验和)
+    for w in range(sizet(2)):
+        run_iters(a, b, c, out, n, iters, mode)
+        last_chk = checksum_sum(out, n)
+
+    # 连续计时 nruns 次; 计时只包住 ITERS 趟内核本身
+    # 双计时: 墙钟 QPC + 线程 CPU(QueryThreadCycleTime), 同时包住同一段内核
+    for r in range(nruns):
+        cy0: int64 = thread_cycles(h_thread, cyc_buf)
+        QueryPerformanceCounter(t0_buf)
+        run_iters(a, b, c, out, n, iters, mode)
+        QueryPerformanceCounter(t1_buf)
+        cy1: int64 = thread_cycles(h_thread, cyc_buf)
+
+        # i64 整数换算: us = (dt * 1e6) / freq, 杜绝浮点表达式的读回歧义
+        dt_i: int64 = qpc_ticks(t1_buf) - qpc_ticks(t0_buf)
+        us_i: int64 = (dt_i * int64(1000000)) / freq_i
+        us: double = double(us_i)
+        # 周期 -> 微秒; 标定失败(tsc_hz==0)时给 0, 表现为一眼可见的异常
+        cpu_us: double = double(0.0)
+        if tsc_hz > double(0.0):
+            cpu_us = double(cy1 - cy0) * double(1000000.0) / tsc_hz
+        flops_i: int64 = (total_i * int64(1000000)) / us_i
+        flops: double = double(flops_i)
+        stdio.printf("RESULT %.3f %.3f %.0f\n", us, cpu_us, flops)
+
+        # 计时区外读回 out: 使本轮写入可观察, 阻止跨 run 优化
+        last_chk = checksum_sum(out, n)
+
+    stdio.printf("CHECK %.17g\n", last_chk)
+    return 0

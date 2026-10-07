@@ -1,0 +1,857 @@
+# main.vp — ViperQtProject：VS Installer 风格安装向导演示
+#
+# 纯界面演示（无真实安装逻辑）：
+#   步骤0 欢迎 → 步骤1 许可协议 → 步骤2 组件选择（树状图）
+#   → 步骤3 安装选项 → 步骤4 安装进度 → 步骤5 完成
+#
+# 完善功能：
+#   - 许可协议页：4 份协议逐份查看、逐份勾选同意（下一步才放下一份，不可跳过）
+#   - 组件选择：QTreeWidget 树状图分组 + 勾选实时统计（数量 / 磁盘占用）
+#   - 安装选项（独立页）：发布渠道 QComboBox + 安装目录 + 快捷方式/PATH/桌面图标
+#   - 安装进度：进度条 + 阶段文案 + 实时日志（QPlainTextEdit）
+#   - 安装按钮点击后禁用，防重复
+#
+# 说明：
+#   - 回调签名统一 def Cb(slot_id: int, data: t.CPtr)
+#   - 跨模块 FFI 调用避免返回指针的函数（用 *_utf8 便捷版 + 整数返回函数）
+#   - 模块级全局只存 t.CPtr 指针（不存对象）
+import t
+import stdlib
+import viperlib
+import vqt6
+
+
+# ============================================================
+# 全局指针（回调里访问）
+# ============================================================
+app_ptr: t.CPtr = None
+stack_ptr: t.CPtr = None
+nav0_ptr: t.CPtr = None
+nav1_ptr: t.CPtr = None
+nav2_ptr: t.CPtr = None
+nav3_ptr: t.CPtr = None
+nav4_ptr: t.CPtr = None
+nav5_ptr: t.CPtr = None
+progress_ptr: t.CPtr = None
+progress_status_ptr: t.CPtr = None
+log_ptr: t.CPtr = None
+path_label_ptr: t.CPtr = None
+summary_ptr: t.CPtr = None
+disk_ptr: t.CPtr = None
+finish_summary_ptr: t.CPtr = None
+timer_ptr: t.CPtr = None
+tree_ptr: t.CPtr = None
+license_box_ptr: t.CPtr = None
+eula_name_ptr: t.CPtr = None
+agree_cb_ptr: t.CPtr = None
+license_next_ptr: t.CPtr = None
+channel_ptr: t.CPtr = None
+install_btn_ptr: t.CPtr = None
+opt0_ptr: t.CPtr = None
+opt1_ptr: t.CPtr = None
+opt2_ptr: t.CPtr = None
+theme_sel_ptr: t.CPtr = None
+central_ptr: t.CPtr = None
+big_ptr: t.CPtr = None
+sub_ptr: t.CPtr = None
+desc_ptr: t.CPtr = None
+lh_ptr: t.CPtr = None
+h2_ptr: t.CPtr = None
+h2b_ptr: t.CPtr = None
+h3_ptr: t.CPtr = None
+s3_ptr: t.CPtr = None
+h4_ptr: t.CPtr = None
+ok_ptr: t.CPtr = None
+fsum_ptr: t.CPtr = None
+oh_ptr: t.CPtr = None
+
+# 全局状态
+cur_step: int = 0
+progress_val: int = 0
+comp_count: int = 0
+install_path: str = "C:/Program Files/Viper6"
+channel_name: str = "稳定版（Stable）"
+eula_idx: int = 0
+eula_agreed: int = 0
+cur_theme: int = 0
+
+
+# ============================================================
+# 深色主题 QSS（VS Installer 风格，单行字面量）
+# ============================================================
+dark_qss: str = "QWidget { background-color: #1e1e1e; color: #d4d4d4; font-family: \"Segoe UI\", \"Microsoft YaHei UI\", \"Microsoft YaHei\", \"PingFang SC\", \"Noto Sans CJK SC\", sans-serif; font-size: 13px; } QPushButton { background-color: #333333; border: 1px solid #555555; border-radius: 4px; padding: 7px 16px; color: #ffffff; } QPushButton:hover { background-color: #454545; border-color: #6a6a6a; } QPushButton:pressed { background-color: #2a6da8; border-color: #4a86c8; } QPushButton:disabled { background-color: #2a2a2a; color: #666666; border-color: #3a3a3a; } QLineEdit, QTextEdit { background-color: #252526; border: 1px solid #555555; border-radius: 4px; padding: 5px 8px; color: #ffffff; } QPlainTextEdit { background-color: #1a1a1a; border: 1px solid #555555; border-radius: 4px; color: #cccccc; } QCheckBox { color: #d4d4d4; spacing: 10px; font-size: 14px; } QProgressBar { background-color: #252526; border: 1px solid #555555; border-radius: 4px; text-align: center; color: #ffffff; font-size: 13px; } QProgressBar::chunk { background-color: #4a86c8; border-radius: 3px; } QTreeWidget { background-color: #1a1a1a; border: 1px solid #555555; border-radius: 4px; color: #d4d4d4; } QTreeWidget::item { height: 26px; padding-left: 4px; } QTreeWidget::item:selected { background-color: #2a6da8; color: #ffffff; } QComboBox { background-color: #252526; border: 1px solid #555555; border-radius: 4px; padding: 5px 10px; color: #ffffff; } QComboBox:hover { border-color: #6a6a6a; } QComboBox::drop-down { border: none; width: 22px; } QComboBox QAbstractItemView { background-color: #252526; color: #ffffff; border: 1px solid #555555; selection-background-color: #2a6da8; } QScrollBar:vertical { background: #252526; width: 10px; margin: 0px; border: none; border-radius: 5px; } QScrollBar::handle:vertical { background: #4a4a4a; min-height: 24px; border-radius: 5px; } QScrollBar::handle:vertical:hover { background: #5a5a5a; } QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; } QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; } QScrollBar:horizontal { background: #252526; height: 10px; margin: 0px; border: none; border-radius: 5px; } QScrollBar::handle:horizontal { background: #4a4a4a; min-width: 24px; border-radius: 5px; } QScrollBar::handle:horizontal:hover { background: #5a5a5a; } QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; } QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }"
+
+light_qss: str = "QWidget { background-color: #f5f6f8; color: #1e1e1e; font-family: \"Segoe UI\", \"Microsoft YaHei UI\", \"Microsoft YaHei\", \"PingFang SC\", \"Noto Sans CJK SC\", sans-serif; font-size: 13px; } QPushButton { background-color: #ffffff; border: 1px solid #b9c0cb; border-radius: 4px; padding: 7px 16px; color: #1e1e1e; } QPushButton:hover { background-color: #eef1f6; border-color: #8a97a8; } QPushButton:pressed { background-color: #2a6da8; border-color: #2a6da8; color: #ffffff; } QPushButton:disabled { background-color: #eceef1; color: #9aa3b0; border-color: #d3d8e0; } QLineEdit, QTextEdit { background-color: #ffffff; border: 1px solid #b9c0cb; border-radius: 4px; padding: 5px 8px; color: #1e1e1e; } QPlainTextEdit { background-color: #ffffff; border: 1px solid #c6ccd6; border-radius: 4px; color: #1e1e1e; } QCheckBox { color: #1e1e1e; spacing: 10px; font-size: 14px; } QProgressBar { background-color: #e2e6ec; border: 1px solid #c6ccd6; border-radius: 4px; text-align: center; color: #1e1e1e; font-size: 13px; } QProgressBar::chunk { background-color: #2a6da8; border-radius: 3px; } QTreeWidget { background-color: #ffffff; border: 1px solid #c6ccd6; border-radius: 4px; color: #1e1e1e; } QTreeWidget::item { height: 26px; padding-left: 4px; } QTreeWidget::item:selected { background-color: #d6e4f5; color: #1e1e1e; } QComboBox { background-color: #ffffff; border: 1px solid #b9c0cb; border-radius: 4px; padding: 5px 10px; color: #1e1e1e; } QComboBox:hover { border-color: #8a97a8; } QComboBox::drop-down { border: none; width: 22px; } QComboBox QAbstractItemView { background-color: #ffffff; color: #1e1e1e; border: 1px solid #b9c0cb; selection-background-color: #d6e4f5; } QScrollBar:vertical { background: #e2e6ec; width: 10px; margin: 0px; border: none; border-radius: 5px; } QScrollBar::handle:vertical { background: #b0b9c6; min-height: 24px; border-radius: 5px; } QScrollBar::handle:vertical:hover { background: #9aa3b0; } QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; } QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; } QScrollBar:horizontal { background: #e2e6ec; height: 10px; margin: 0px; border: none; border-radius: 5px; } QScrollBar::handle:horizontal { background: #b0b9c6; min-width: 24px; border-radius: 5px; } QScrollBar::handle:horizontal:hover { background: #9aa3b0; } QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; } QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }"
+
+
+# 导航项样式
+nav_active_qss: str = "font-size: 15px; color: #ffffff; font-weight: bold; background-color: #2a6da8; padding: 10px 14px; border-radius: 4px;"
+nav_idle_qss: str = "font-size: 15px; color: #8a8a8a; padding: 10px 14px;"
+nav_active_qss_light: str = "font-size: 15px; color: #ffffff; font-weight: bold; background-color: #2a6da8; padding: 10px 14px; border-radius: 4px;"
+nav_idle_qss_light: str = "font-size: 15px; color: #5a6470; padding: 10px 14px;"
+
+# ============================================================
+# 文字样式角色（深/浅主题变体）
+# ============================================================
+t_d_huge: str = "font-size: 34px; color: #ffffff; font-weight: bold;"
+t_l_huge: str = "font-size: 34px; color: #1e1e1e; font-weight: bold;"
+t_d_title: str = "font-size: 22px; color: #ffffff; font-weight: bold;"
+t_l_title: str = "font-size: 22px; color: #1e1e1e; font-weight: bold;"
+t_d_sub: str = "font-size: 16px; color: #9cdcfe;"
+t_l_sub: str = "font-size: 16px; color: #2a6da8;"
+t_d_dim: str = "font-size: 13px; color: #9a9a9a;"
+t_l_dim: str = "font-size: 13px; color: #5a6470;"
+t_d_accent: str = "font-size: 13px; color: #9cdcfe;"
+t_l_accent: str = "font-size: 13px; color: #2a6da8;"
+t_d_ok: str = "font-size: 30px; color: #4ec9b0; font-weight: bold;"
+t_l_ok: str = "font-size: 30px; color: #178a63; font-weight: bold;"
+t_d_body: str = "font-size: 14px; color: #d4d4d4;"
+t_l_body: str = "font-size: 14px; color: #1e1e1e;"
+t_d_pathbox: str = "background-color: #252526; border: 1px solid #555555; border-radius: 4px; padding: 5px 8px; color: #ffffff;"
+t_l_pathbox: str = "background-color: #ffffff; border: 1px solid #b9c0cb; border-radius: 4px; padding: 5px 8px; color: #1e1e1e;"
+t_d_section: str = "font-size: 15px; color: #ffffff; font-weight: bold; padding-top: 6px;"
+t_l_section: str = "font-size: 15px; color: #1e1e1e; font-weight: bold; padding-top: 6px;"
+
+
+# ============================================================
+# 主题辅助：返回当前主题下的样式字符串
+# ============================================================
+def NavActiveCss() -> str:
+    if cur_theme == 1:
+        return nav_active_qss_light
+    return nav_active_qss
+
+
+def NavIdleCss() -> str:
+    if cur_theme == 1:
+        return nav_idle_qss_light
+    return nav_idle_qss
+
+
+def CssHuge() -> str:
+    if cur_theme == 1:
+        return t_l_huge
+    return t_d_huge
+
+
+def CssTitle() -> str:
+    if cur_theme == 1:
+        return t_l_title
+    return t_d_title
+
+
+def CssSub() -> str:
+    if cur_theme == 1:
+        return t_l_sub
+    return t_d_sub
+
+
+def CssDim() -> str:
+    if cur_theme == 1:
+        return t_l_dim
+    return t_d_dim
+
+
+def CssAccent() -> str:
+    if cur_theme == 1:
+        return t_l_accent
+    return t_d_accent
+
+
+def CssOk() -> str:
+    if cur_theme == 1:
+        return t_l_ok
+    return t_d_ok
+
+
+def CssBody() -> str:
+    if cur_theme == 1:
+        return t_l_body
+    return t_d_body
+
+
+def CssPathBox() -> str:
+    if cur_theme == 1:
+        return t_l_pathbox
+    return t_d_pathbox
+
+
+def CssSection() -> str:
+    if cur_theme == 1:
+        return t_l_section
+    return t_d_section
+
+
+# ============================================================
+# EULA 文档文本（多份协议文件）
+# ============================================================
+license_text: str = "VIPER 6.0 最终用户许可协议\n\n重要 - 请仔细阅读：本最终用户许可协议（以下简称\"协议\"）是您与 Viper Software Foundation 之间就 Viper 6.0 软件达成的法律协议。\n\n1. 许可授予。在遵守本协议条款的前提下，您被授予一份非独占、不可转让的许可，允许在您的设备上安装和使用本软件用于开发与测试目的。\n\n2. 使用限制。您不得对本软件进行反向工程、反编译或反汇编（适用法律明确允许的除外）；不得删除或修改软件中的版权声明。\n\n3. 开源组件。本软件包含根据 MIT、BSD 与 LGPL 许可发布的第三方开源组件，相关许可文本随附于软件文档中。\n\n4. 免责声明。本软件按\"现状\"提供，不附带任何明示或默示的担保，包括但不限于适销性、特定用途适用性及不侵权的担保。\n\n5. 责任限制。在任何情况下，Viper Software Foundation 均不对因使用或无法使用本软件而产生的任何间接、偶然、特殊或后果性损害承担责任。\n\n6. 协议终止。若您违反本协议的任何条款，本协议将自动终止，您应停止使用并删除本软件的全部副本。\n\n请阅读以上条款。要安装 Viper 6.0，必须接受这些条款并勾选下方的\"我接受许可协议中的条款\"。"
+
+oss_text: str = "第三方开源组件许可声明\n\n本软件的部分功能基于以下第三方开源组件构建，相关许可全文可在各组件的发行包或代码仓库中查阅。\n\n1. Qt 6（LGPL v3 / GPL v3 / 商业许可）\nQt 图形界面框架及 Qt Widgets / Qt Network 模块，用于本向导的用户界面。本演示程序以 LGPL 条款使用 Qt 的共享库方式运行。\n\n2. LLVM / Clang 工具链（Apache License 2.0）\nViper 编译器后端与目标代码生成依赖 LLVM 基础设施。\n\n3. 开源许可证文本库（CC0）\n本向导使用的协议模板文本来源于公共领域资料，可自由复制与修改。\n\n4. 其它依赖\nmingw-w64 运行库（BSD/公共领域）与 zlib（zlib License）等。\n\n上述组件仅用于本软件的构建与运行，不构成对 Viper 语言本身的授权限制。"
+
+privacy_text: str = "隐私政策\n\n本安装向导为本地演示程序，在安装过程中不会收集、上传或存储任何个人身份信息。\n\n1. 本地数据处理。您选择的组件、安装目录与安装选项仅保存在本机配置中，用于完成安装流程。\n\n2. 遥测与诊断。本软件默认不发送任何遥测数据。若您日后启用了诊断反馈功能，仅会上传安装日志中与错误定位相关的必要信息。\n\n3. 第三方链接。向导中出现的任何外部链接（如帮助文档）将在您主动点击时打开，相关站点不受本政策约束。\n\n4. 联系我们。如对本政策有任何疑问，可通过 Viper Software Foundation 官网的支持页面与我们联系。"
+
+credits_text: str = "商标与版权声明\n\nViper、Viper 徽标与相关名称是 Viper Software Foundation 及其关联方的商标。\n\n本演示程序界面设计参考了行业通用安装向导的交互范式，仅用于功能与技术展示，不构成对任何第三方安装程序视觉风格的授权主张。\n\n本软件版权归 Viper Software Foundation 所有，保留一切权利。\n\n版本信息：Viper 6.0.1 · 2026"
+
+# EULA 文档名（显示序号用）
+doc_name0: str = "Viper 6.0 最终用户许可协议"
+doc_name1: str = "第三方开源组件许可声明"
+doc_name2: str = "隐私政策"
+doc_name3: str = "商标与版权声明"
+
+# 发布渠道文本
+channel_stable: str = "稳定版（Stable）"
+channel_preview: str = "预览版（Preview）"
+channel_dev: str = "开发版（Developer）"
+str_yes: str = "是"
+str_no: str = "否"
+
+
+# ============================================================
+# 工具：切换步骤 + 导航高亮
+# ============================================================
+def SetNavStyle(ptr: t.CPtr, qss: str):
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(ptr, qss)
+
+
+def GotoStep(step: int):
+    global cur_step
+    cur_step = step
+    vqt6.vqt6_qstackedwidget_set_current_index(stack_ptr, step)
+    # 导航高亮（按当前主题）
+    SetNavStyle(nav0_ptr, NavActiveCss() if step == 0 else NavIdleCss())
+    SetNavStyle(nav1_ptr, NavActiveCss() if step == 1 else NavIdleCss())
+    SetNavStyle(nav2_ptr, NavActiveCss() if step == 2 else NavIdleCss())
+    SetNavStyle(nav3_ptr, NavActiveCss() if step == 3 else NavIdleCss())
+    SetNavStyle(nav4_ptr, NavActiveCss() if step == 4 else NavIdleCss())
+    SetNavStyle(nav5_ptr, NavActiveCss() if step == 5 else NavIdleCss())
+
+
+# ============================================================
+# 步骤0：欢迎页
+# ============================================================
+def OnNext(slot_id: int, data: t.CPtr):
+    EnterEulaPage()
+    GotoStep(1)
+
+
+# ============================================================
+# 步骤1：许可协议（逐份查看 + 逐份同意）
+# ============================================================
+def ShowEulaDoc(idx: int):
+    """显示第 idx 份协议，并回填该协议的已同意状态"""
+    txt: str = license_text
+    name: str = doc_name0
+    if idx == 1:
+        txt = oss_text
+        name = doc_name1
+    elif idx == 2:
+        txt = privacy_text
+        name = doc_name2
+    elif idx == 3:
+        txt = credits_text
+        name = doc_name3
+    # 标题（x/4 · 协议名）
+    buf: bytes = stdlib.malloc(128)
+    viperlib.snprintf(buf, 128, "%d/4 · %s", idx + 1, name)
+    vqt6.vqt6_qlabel_set_text_utf8(eula_name_ptr, buf)
+    stdlib.free(buf)
+    # 正文
+    vqt6.vqt6_qplaintextedit_set_plain_text_utf8(license_box_ptr, txt)
+    # 回填该协议已同意状态
+    agreed: int = (eula_agreed >> idx) & 1
+    vqt6.vqt6_qcheckbox_set_checked(agree_cb_ptr, agreed)
+    vqt6.vqt6_qwidget_set_enabled(license_next_ptr, agreed)
+
+
+def EnterEulaPage():
+    """进入许可页：全部已同意则停在末份，否则续接当前进度"""
+    global eula_idx
+    if eula_agreed == 15:
+        ShowEulaDoc(3)
+    else:
+        ShowEulaDoc(eula_idx)
+
+
+def OnLicenseToggled(slot_id: int, data: t.CPtr):
+    """勾选当前协议后才允许下一步"""
+    checked: int = vqt6.vqt6_qcheckbox_is_checked(agree_cb_ptr)
+    vqt6.vqt6_qwidget_set_enabled(license_next_ptr, checked)
+
+
+def OnLicenseNext(slot_id: int, data: t.CPtr):
+    """逐份同意：点下一步才放下一份；末份同意后进入组件选择"""
+    global eula_idx, eula_agreed
+    idx: int = eula_idx
+    if idx < 0 or idx > 3:
+        GotoStep(2)
+        return
+    if vqt6.vqt6_qcheckbox_is_checked(agree_cb_ptr) != 0:
+        eula_agreed = eula_agreed | (1 << idx)
+    if idx >= 3:
+        GotoStep(2)
+    else:
+        eula_idx = idx + 1
+        ShowEulaDoc(eula_idx)
+
+
+def OnLicenseBack(slot_id: int, data: t.CPtr):
+    GotoStep(0)
+
+
+# ============================================================
+# 步骤2：组件选择（树状图）
+# ============================================================
+def OnBack(slot_id: int, data: t.CPtr):
+    EnterEulaPage()
+    GotoStep(1)
+
+
+def OnCompNext(slot_id: int, data: t.CPtr):
+    GotoStep(3)
+
+
+def UpdateCompInfo():
+    """统计树勾选组件数与磁盘占用（跨模块用返回 int 的 vqt6 助手）"""
+    global comp_count
+    n: int = vqt6.qtree_checked_count(tree_ptr)
+    mb: int = vqt6.qtree_checked_size(tree_ptr)
+    comp_count = n
+    buf1: bytes = stdlib.malloc(96)
+    viperlib.snprintf(buf1, 96, "已选择 %d 个组件", n)
+    vqt6.vqt6_qlabel_set_text_utf8(summary_ptr, buf1)
+    stdlib.free(buf1)
+    buf2: bytes = stdlib.malloc(96)
+    viperlib.snprintf(buf2, 96, "所需磁盘空间: %d MB / 可用 51200 MB", mb)
+    vqt6.vqt6_qlabel_set_text_utf8(disk_ptr, buf2)
+    stdlib.free(buf2)
+
+
+def OnCompToggled(slot_id: int, data: t.CPtr):
+    """树节点勾选变化：重算组件数与磁盘占用"""
+    UpdateCompInfo()
+
+
+# ============================================================
+# 步骤3：安装选项（独立页）
+# ============================================================
+def OnOptionsBack(slot_id: int, data: t.CPtr):
+    GotoStep(2)
+
+
+def OnBrowse(slot_id: int, data: t.CPtr):
+    global install_path
+    p: str = vqt6.QFileDialog.getExistingDirectory(None, "选择安装目录", "C:/")
+    if p is not None and p != "":
+        install_path = p
+        vqt6.vqt6_qlabel_set_text_utf8(path_label_ptr, p)
+
+
+def OnChannelChanged(slot_id: int, data: t.CPtr):
+    """发布渠道切换"""
+    global channel_name
+    idx: int = vqt6.vqt6_qcombobox_current_index(channel_ptr)
+    if idx == 1: channel_name = channel_preview
+    elif idx == 2: channel_name = channel_dev
+    else: channel_name = channel_stable
+
+
+def OnInstall(slot_id: int, data: t.CPtr):
+    """进入安装页并启动模拟进度"""
+    global progress_val
+    vqt6.vqt6_qwidget_set_enabled(install_btn_ptr, 0)
+    GotoStep(4)
+    progress_val = 0
+    vqt6.vqt6_qprogressbar_set_value(progress_ptr, 0)
+    vqt6.vqt6_qlabel_set_text_utf8(progress_status_ptr, "正在准备安装环境...")
+    vqt6.vqt6_qplaintextedit_append_utf8(log_ptr, "== 开始安装 Viper 6.0 ==\n")
+    vqt6.vqt6_qtimer_start(timer_ptr, 80)
+
+
+# ============================================================
+# 步骤4：安装进度（QTimer 模拟）
+# ============================================================
+def OnProgressTick(slot_id: int, data: t.CPtr):
+    global progress_val
+    progress_val += 4
+    vqt6.vqt6_qprogressbar_set_value(progress_ptr, progress_val)
+    if progress_val == 4:
+        vqt6.vqt6_qplaintextedit_append_utf8(log_ptr, "[1/4] 正在准备安装环境...\n")
+    elif progress_val == 28:
+        vqt6.vqt6_qlabel_set_text_utf8(progress_status_ptr, "正在复制核心文件...")
+        vqt6.vqt6_qplaintextedit_append_utf8(log_ptr, "[2/4] 正在复制核心文件...\n")
+    elif progress_val == 52:
+        vqt6.vqt6_qlabel_set_text_utf8(progress_status_ptr, "正在配置 Qt6 组件...")
+        vqt6.vqt6_qplaintextedit_append_utf8(log_ptr, "[3/4] 正在配置 Qt6 组件...\n")
+    elif progress_val == 76:
+        vqt6.vqt6_qlabel_set_text_utf8(progress_status_ptr, "正在注册系统组件...")
+        vqt6.vqt6_qplaintextedit_append_utf8(log_ptr, "[4/4] 正在注册系统组件...\n")
+    elif progress_val >= 100:
+        vqt6.vqt6_qtimer_stop(timer_ptr)
+        vqt6.vqt6_qplaintextedit_append_utf8(log_ptr, "安装完成！\n")
+        # 完成页摘要（含安装选项 + 渠道）
+        yn0: str = str_yes if vqt6.vqt6_qcheckbox_is_checked(opt0_ptr) != 0 else str_no
+        yn1: str = str_yes if vqt6.vqt6_qcheckbox_is_checked(opt1_ptr) != 0 else str_no
+        yn2: str = str_yes if vqt6.vqt6_qcheckbox_is_checked(opt2_ptr) != 0 else str_no
+        buf: bytes = stdlib.malloc(512)
+        viperlib.snprintf(buf, 512, "安装位置: %s\n发布渠道: %s\n已安装组件: %d 个\n快捷方式: %s / PATH: %s / 桌面图标: %s\n\nViper 6.0 已成功安装到您的系统。", install_path, channel_name, comp_count, yn0, yn1, yn2)
+        vqt6.vqt6_qlabel_set_text_utf8(finish_summary_ptr, buf)
+        stdlib.free(buf)
+        GotoStep(5)
+
+
+# ============================================================
+# 步骤5：完成页
+# ============================================================
+def OnFinish(slot_id: int, data: t.CPtr):
+    vqt6.vqt6_qapplication_quit(app_ptr)
+
+
+# ============================================================
+# 主题切换（右上角）
+# ============================================================
+def RestyleAll():
+    """按当前主题重刷带内联样式的关键控件"""
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(big_ptr, CssHuge())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(sub_ptr, CssSub())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(desc_ptr, CssDim())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(lh_ptr, CssTitle())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(h2_ptr, CssTitle())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(h2b_ptr, CssDim())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(h3_ptr, CssTitle())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(s3_ptr, CssDim())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(h4_ptr, CssTitle())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(eula_name_ptr, CssAccent())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(summary_ptr, CssAccent())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(disk_ptr, CssAccent())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(oh_ptr, CssSection())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(ok_ptr, CssOk())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(fsum_ptr, CssBody())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(progress_status_ptr, CssDim())
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(path_label_ptr, CssPathBox())
+
+
+def ApplyTheme(theme: int):
+    """切换深/浅主题：先设应用调色板（原生控件配色），再换 QSS 并重刷内联样式"""
+    global cur_theme
+    cur_theme = theme
+    vqt6.vqt6_qapplication_set_theme_palette(app_ptr, theme)
+    if theme == 1:
+        vqt6.vqt6_qwidget_set_stylesheet_utf8(central_ptr, light_qss)
+    else:
+        vqt6.vqt6_qwidget_set_stylesheet_utf8(central_ptr, dark_qss)
+    RestyleAll()
+    GotoStep(cur_step)
+
+
+def SetTextPtrs(big: t.CPtr, sub: t.CPtr, desc: t.CPtr, lh: t.CPtr, h2: t.CPtr, h2b: t.CPtr, h3: t.CPtr, s3: t.CPtr, h4: t.CPtr, ok: t.CPtr, fsum: t.CPtr, oh: t.CPtr):
+    """记录各页文本标签指针（供主题切换重刷内联样式）"""
+    global big_ptr, sub_ptr, desc_ptr, lh_ptr
+    global h2_ptr, h2b_ptr, h3_ptr, s3_ptr, h4_ptr, ok_ptr, fsum_ptr, oh_ptr
+    big_ptr = big
+    sub_ptr = sub
+    desc_ptr = desc
+    lh_ptr = lh
+    h2_ptr = h2
+    h2b_ptr = h2b
+    h3_ptr = h3
+    s3_ptr = s3
+    h4_ptr = h4
+    ok_ptr = ok
+    fsum_ptr = fsum
+    oh_ptr = oh
+
+
+def OnThemeChanged(slot_id: int, data: t.CPtr):
+    idx: int = vqt6.vqt6_qcombobox_current_index(theme_sel_ptr)
+    ApplyTheme(idx)
+
+
+def main() -> int:
+    global app_ptr, stack_ptr
+    global nav0_ptr, nav1_ptr, nav2_ptr, nav3_ptr, nav4_ptr, nav5_ptr
+    global progress_ptr, progress_status_ptr, log_ptr, path_label_ptr
+    global summary_ptr, disk_ptr, finish_summary_ptr, timer_ptr
+    global tree_ptr, license_box_ptr, eula_name_ptr
+    global agree_cb_ptr, license_next_ptr, install_btn_ptr
+    global channel_ptr, opt0_ptr, opt1_ptr, opt2_ptr
+    global theme_sel_ptr, central_ptr
+
+    app = vqt6.QApplication(t.CPtr(0))
+    app_ptr = t.CPtr(app._ptr)
+    vqt6.vqt6_qapplication_set_theme_palette(app_ptr, 0)
+    # 启用 item-view（组件树）勾选与复选框同一套自绘渲染
+    vqt6.vqt6_enable_custom_item_checks(app_ptr)
+
+    # 主窗口（更宽更高）
+    win = vqt6.QMainWindow()
+    win.setWindowTitle("Viper 6.0 Installer")
+    win.resize(1180, 780)
+    vqt6.vqt6_qwidget_set_minimum_size(win._ptr, 1080, 700)
+
+    central = vqt6.QWidget()
+    central.setStyleSheet(dark_qss)
+    win.setCentralWidget(central._ptr)
+    central_ptr = t.CPtr(central._ptr)
+
+    vroot = vqt6.QVBoxLayout(central)
+    vroot.setContentsMargins(0, 0, 0, 0)
+    vroot.setSpacing(0)
+
+    # ===== 右上角：主题切换 =====
+    topbar = vqt6.QHBoxLayout()
+    topbar.setContentsMargins(0, 6, 14, 2)
+    topbar.setSpacing(8)
+    vroot.addLayout(topbar._ptr)
+    topbar.addStretch(1)
+    theme_lb = vqt6.QLabel("主题:")
+    topbar.addWidget(theme_lb._ptr)
+    theme_sel = vqt6.QComboBox()
+    theme_sel.addItem("深色")
+    theme_sel.addItem("浅色")
+    theme_sel.setCurrentIndex(0)
+    topbar.addWidget(theme_sel._ptr)
+    theme_sel_ptr = t.CPtr(theme_sel._ptr)
+    theme_sel.currentIndexChanged(OnThemeChanged, 0)
+
+    root = vqt6.QHBoxLayout()
+    root.setContentsMargins(0, 0, 0, 0)
+    vroot.addLayout(root._ptr)
+
+    # ===== 左导航面板（宽度固定，高度随窗口拉伸） =====
+    nav_panel = vqt6.QWidget()
+    vqt6.vqt6_qwidget_set_minimum_size(nav_panel._ptr, 240, 0)
+    vqt6.vqt6_qwidget_set_maximum_size(nav_panel._ptr, 240, 10000)
+    nav_box = vqt6.QVBoxLayout(nav_panel)
+    nav_box.setContentsMargins(10, 16, 10, 10)
+    nav_box.setSpacing(6)
+
+    title_lb = vqt6.QLabel("Viper 6.0")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(title_lb._ptr, "font-size: 20px; color: #4a86c8; font-weight: bold; padding: 6px 14px;")
+    nav_box.addWidget(title_lb._ptr)
+
+    nav0 = vqt6.QLabel("欢迎")
+    nav0.setStyleSheet(nav_active_qss)
+    nav_box.addWidget(nav0._ptr)
+    nav0_ptr = t.CPtr(nav0._ptr)
+
+    nav1 = vqt6.QLabel("许可协议")
+    nav1.setStyleSheet(nav_idle_qss)
+    nav_box.addWidget(nav1._ptr)
+    nav1_ptr = t.CPtr(nav1._ptr)
+
+    nav2 = vqt6.QLabel("选择组件")
+    nav2.setStyleSheet(nav_idle_qss)
+    nav_box.addWidget(nav2._ptr)
+    nav2_ptr = t.CPtr(nav2._ptr)
+
+    nav3 = vqt6.QLabel("安装选项")
+    nav3.setStyleSheet(nav_idle_qss)
+    nav_box.addWidget(nav3._ptr)
+    nav3_ptr = t.CPtr(nav3._ptr)
+
+    nav4 = vqt6.QLabel("安装进度")
+    nav4.setStyleSheet(nav_idle_qss)
+    nav_box.addWidget(nav4._ptr)
+    nav4_ptr = t.CPtr(nav4._ptr)
+
+    nav5 = vqt6.QLabel("完成")
+    nav5.setStyleSheet(nav_idle_qss)
+    nav_box.addWidget(nav5._ptr)
+    nav5_ptr = t.CPtr(nav5._ptr)
+
+    nav_box.addStretch(1)
+    ver_lb = vqt6.QLabel("v6.0.1 · 2026")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(ver_lb._ptr, "color: #666666; padding: 6px 14px;")
+    nav_box.addWidget(ver_lb._ptr)
+
+    root.addWidget(nav_panel._ptr)
+
+    # ===== 右侧步骤容器 =====
+    stack = vqt6.QStackedWidget()
+    root.addWidget(stack._ptr)
+    stack_ptr = t.CPtr(stack._ptr)
+
+    # ---------- 页0：欢迎 ----------
+    page0 = vqt6.QWidget()
+    p0 = vqt6.QVBoxLayout(page0)
+    p0.setContentsMargins(36, 40, 36, 24)
+    p0.setSpacing(12)
+
+    big = vqt6.QLabel("Viper 6.0")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(big._ptr, "font-size: 34px; color: #ffffff; font-weight: bold;")
+    p0.addWidget(big._ptr)
+
+    sub = vqt6.QLabel("为 Viper 语言平台安装工具链、Qt6 运行时与开发组件")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(sub._ptr, "font-size: 16px; color: #9cdcfe;")
+    p0.addWidget(sub._ptr)
+
+    desc = vqt6.QLabel("本向导将引导您完成 Viper 6.0 的安装。您可以自定义要安装的组件、\n安装选项与发布渠道，安装过程由模拟进度与日志展示（演示界面，无真实安装行为）。")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(desc._ptr, "font-size: 13px; color: #9a9a9a;")
+    p0.addWidget(desc._ptr)
+
+    p0.addStretch(1)
+    next_btn = vqt6.QPushButton("下一步 >")
+    p0.addWidget(next_btn._ptr)
+    next_btn.clicked(OnNext, 0)
+
+    stack.addWidget(page0._ptr)
+
+    # ---------- 页1：许可协议（逐份同意） ----------
+    page1 = vqt6.QWidget()
+    p1 = vqt6.QVBoxLayout(page1)
+    p1.setContentsMargins(36, 32, 36, 24)
+    p1.setSpacing(10)
+
+    lh = vqt6.QLabel("许可协议")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(lh._ptr, "font-size: 22px; color: #ffffff; font-weight: bold;")
+    p1.addWidget(lh._ptr)
+
+    eula_name = vqt6.QLabel("1/4 · Viper 6.0 最终用户许可协议")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(eula_name._ptr, "font-size: 13px; color: #9cdcfe;")
+    p1.addWidget(eula_name._ptr)
+    eula_name_ptr = t.CPtr(eula_name._ptr)
+
+    license_box = vqt6.QPlainTextEdit()
+    license_box.setPlainText(license_text)
+    license_box.setReadOnly(1)
+    p1.addWidget(license_box._ptr)
+    license_box_ptr = t.CPtr(license_box._ptr)
+
+    agree_cb = vqt6.QCheckBox("我接受上述协议条款")
+    p1.addWidget(agree_cb._ptr)
+    agree_cb_ptr = t.CPtr(agree_cb._ptr)
+    agree_cb.toggled(OnLicenseToggled, 0)
+
+    lbrow = vqt6.QHBoxLayout()
+    p1.addLayout(lbrow._ptr)
+    lbrow.addStretch(1)
+    lic_back = vqt6.QPushButton("< 上一步")
+    lbrow.addWidget(lic_back._ptr)
+    lic_back.clicked(OnLicenseBack, 0)
+    lic_next = vqt6.QPushButton("下一步 >")
+    lic_next.setEnabled(0)
+    lbrow.addWidget(lic_next._ptr)
+    license_next_ptr = t.CPtr(lic_next._ptr)
+    lic_next.clicked(OnLicenseNext, 0)
+
+    stack.addWidget(page1._ptr)
+
+    # ---------- 页2：组件选择（树状图） ----------
+    page2 = vqt6.QWidget()
+    p2 = vqt6.QVBoxLayout(page2)
+    p2.setContentsMargins(36, 28, 36, 20)
+    p2.setSpacing(8)
+
+    h2 = vqt6.QLabel("选择要安装的组件")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(h2._ptr, "font-size: 22px; color: #ffffff; font-weight: bold;")
+    p2.addWidget(h2._ptr)
+
+    h2b = vqt6.QLabel("展开分类并勾选需要的组件，实时统计安装体积与磁盘占用。")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(h2b._ptr, "font-size: 13px; color: #9a9a9a;")
+    p2.addWidget(h2b._ptr)
+
+    tree = vqt6.QTreeWidget()
+    tree.setHeaderHidden(1)
+    p2.addWidget(tree._ptr)
+    tree_ptr = t.CPtr(tree._ptr)
+
+    # 叶子磁盘占用经 setSize 存入节点 UserRole，统计时自动读取
+    g0 = vqt6.QTreeWidgetItem("开发工具链")
+    leaf = vqt6.QTreeWidgetItem("Viper 核心编译器与运行时（编译器 + 标准库运行时）[850 MB]")
+    leaf.setCheckable(1)
+    leaf.setChecked(1)
+    leaf.setSize(850)
+    g0.addChild(leaf)
+    leaf = vqt6.QTreeWidgetItem("Viper 标准库与 includes 包 [350 MB]")
+    leaf.setCheckable(1)
+    leaf.setChecked(1)
+    leaf.setSize(350)
+    g0.addChild(leaf)
+    tree.addTopLevelItem(g0)
+
+    g1 = vqt6.QTreeWidgetItem("GUI 与网络开发")
+    leaf = vqt6.QTreeWidgetItem("Qt6 桌面开发框架（GUI + vqt6 桥接库）[1200 MB]")
+    leaf.setCheckable(1)
+    leaf.setChecked(1)
+    leaf.setSize(1200)
+    g1.addChild(leaf)
+    leaf = vqt6.QTreeWidgetItem("网络与调试工具（QtNetwork + TPV）[220 MB]")
+    leaf.setCheckable(1)
+    leaf.setChecked(0)
+    leaf.setSize(220)
+    g1.addChild(leaf)
+    tree.addTopLevelItem(g1)
+
+    g2 = vqt6.QTreeWidgetItem("附加内容")
+    leaf = vqt6.QTreeWidgetItem("示例项目与开发文档 [90 MB]")
+    leaf.setCheckable(1)
+    leaf.setChecked(0)
+    leaf.setSize(90)
+    g2.addChild(leaf)
+    tree.addTopLevelItem(g2)
+
+    tree.expandAll()
+    tree.itemChanged(OnCompToggled, 0)
+
+    summary = vqt6.QLabel("已选择 3 个组件")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(summary._ptr, "font-size: 13px; color: #9cdcfe;")
+    p2.addWidget(summary._ptr)
+    summary_ptr = t.CPtr(summary._ptr)
+
+    disk = vqt6.QLabel("所需磁盘空间: 2400 MB / 可用 51200 MB")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(disk._ptr, "font-size: 13px; color: #9cdcfe;")
+    p2.addWidget(disk._ptr)
+    disk_ptr = t.CPtr(disk._ptr)
+
+    btn_row2 = vqt6.QHBoxLayout()
+    p2.addLayout(btn_row2._ptr)
+    btn_row2.addStretch(1)
+    back_btn = vqt6.QPushButton("< 上一步")
+    btn_row2.addWidget(back_btn._ptr)
+    back_btn.clicked(OnBack, 0)
+    comp_next_btn = vqt6.QPushButton("下一步 >")
+    btn_row2.addWidget(comp_next_btn._ptr)
+    comp_next_btn.clicked(OnCompNext, 0)
+
+    stack.addWidget(page2._ptr)
+
+    # ---------- 页3：安装选项（独立页） ----------
+    page3 = vqt6.QWidget()
+    p3 = vqt6.QVBoxLayout(page3)
+    p3.setContentsMargins(36, 28, 36, 20)
+    p3.setSpacing(12)
+
+    h3 = vqt6.QLabel("安装选项")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(h3._ptr, "font-size: 22px; color: #ffffff; font-weight: bold;")
+    p3.addWidget(h3._ptr)
+
+    s3 = vqt6.QLabel("选择发布渠道、界面集成方式与安装目录。")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(s3._ptr, "font-size: 13px; color: #9a9a9a;")
+    p3.addWidget(s3._ptr)
+
+    ch_row = vqt6.QHBoxLayout()
+    p3.addLayout(ch_row._ptr)
+    ch_lb = vqt6.QLabel("发布渠道:")
+    ch_row.addWidget(ch_lb._ptr)
+    channel_cb = vqt6.QComboBox()
+    channel_cb.addItem(channel_stable)
+    channel_cb.addItem(channel_preview)
+    channel_cb.addItem(channel_dev)
+    channel_cb.setCurrentIndex(0)
+    ch_row.addWidget(channel_cb._ptr)
+    ch_row.addStretch(1)
+    channel_ptr = t.CPtr(channel_cb._ptr)
+    channel_cb.currentIndexChanged(OnChannelChanged, 0)
+
+    oh = vqt6.QLabel("界面集成方式")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(oh._ptr, "font-size: 15px; color: #ffffff; font-weight: bold; padding-top: 6px;")
+    p3.addWidget(oh._ptr)
+
+    opt0 = vqt6.QCheckBox("创建开始菜单快捷方式")
+    opt0.setChecked(1)
+    p3.addWidget(opt0._ptr)
+    opt0_ptr = t.CPtr(opt0._ptr)
+
+    opt1 = vqt6.QCheckBox("将 viper 命令添加到系统 PATH")
+    opt1.setChecked(0)
+    p3.addWidget(opt1._ptr)
+    opt1_ptr = t.CPtr(opt1._ptr)
+
+    opt2 = vqt6.QCheckBox("创建桌面图标")
+    opt2.setChecked(0)
+    p3.addWidget(opt2._ptr)
+    opt2_ptr = t.CPtr(opt2._ptr)
+
+    # 安装位置行
+    path_row = vqt6.QHBoxLayout()
+    p3.addLayout(path_row._ptr)
+    path_lb = vqt6.QLabel("安装位置:")
+    path_row.addWidget(path_lb._ptr)
+    path_lb2 = vqt6.QLabel(install_path)
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(path_lb2._ptr, "background-color: #252526; border: 1px solid #555555; border-radius: 4px; padding: 5px 8px; color: #ffffff;")
+    path_row.addWidget(path_lb2._ptr)
+    path_label_ptr = t.CPtr(path_lb2._ptr)
+    browse_btn = vqt6.QPushButton("浏览...")
+    path_row.addWidget(browse_btn._ptr)
+    browse_btn.clicked(OnBrowse, 0)
+
+    p3.addStretch(1)
+
+    btn_row3 = vqt6.QHBoxLayout()
+    p3.addLayout(btn_row3._ptr)
+    btn_row3.addStretch(1)
+    back3_btn = vqt6.QPushButton("< 上一步")
+    btn_row3.addWidget(back3_btn._ptr)
+    back3_btn.clicked(OnOptionsBack, 0)
+    install_btn = vqt6.QPushButton("安装")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(install_btn._ptr, "background-color: #2a6da8; border: 1px solid #2a6da8; border-radius: 4px; padding: 8px 22px; color: #ffffff; font-size: 14px; font-weight: bold;")
+    btn_row3.addWidget(install_btn._ptr)
+    install_btn_ptr = t.CPtr(install_btn._ptr)
+    install_btn.clicked(OnInstall, 0)
+
+    stack.addWidget(page3._ptr)
+
+    # ---------- 页4：安装进度 ----------
+    page4 = vqt6.QWidget()
+    p4 = vqt6.QVBoxLayout(page4)
+    p4.setContentsMargins(36, 36, 36, 24)
+    p4.setSpacing(12)
+
+    h4 = vqt6.QLabel("正在安装 Viper 6.0...")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(h4._ptr, "font-size: 22px; color: #ffffff; font-weight: bold;")
+    p4.addWidget(h4._ptr)
+
+    prog = vqt6.QProgressBar()
+    prog.setRange(0, 100)
+    prog.setValue(0)
+    p4.addWidget(prog._ptr)
+    progress_ptr = t.CPtr(prog._ptr)
+
+    pstat = vqt6.QLabel("正在准备安装环境...")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(pstat._ptr, "font-size: 13px; color: #9a9a9a;")
+    p4.addWidget(pstat._ptr)
+    progress_status_ptr = t.CPtr(pstat._ptr)
+
+    log = vqt6.QPlainTextEdit()
+    log.setReadOnly(1)
+    p4.addWidget(log._ptr)
+    log_ptr = t.CPtr(log._ptr)
+
+    stack.addWidget(page4._ptr)
+
+    # ---------- 页5：完成 ----------
+    page5 = vqt6.QWidget()
+    p5 = vqt6.QVBoxLayout(page5)
+    p5.setContentsMargins(36, 40, 36, 24)
+    p5.setSpacing(14)
+
+    ok = vqt6.QLabel("安装完成")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(ok._ptr, "font-size: 30px; color: #4ec9b0; font-weight: bold;")
+    p5.addWidget(ok._ptr)
+
+    fsum = vqt6.QLabel("")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(fsum._ptr, "font-size: 14px; color: #d4d4d4;")
+    p5.addWidget(fsum._ptr)
+    finish_summary_ptr = t.CPtr(fsum._ptr)
+
+    p5.addStretch(1)
+    finish_btn = vqt6.QPushButton("完成")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(finish_btn._ptr, "background-color: #2a6da8; border-radius: 4px; padding: 8px 22px; color: #ffffff; font-size: 14px; font-weight: bold;")
+    p5.addWidget(finish_btn._ptr)
+    finish_btn.clicked(OnFinish, 0)
+
+    stack.addWidget(page5._ptr)
+
+    # ===== 定时器（模拟安装进度） =====
+    timer = vqt6.QTimer()
+    timer.timeout(OnProgressTick, 0)
+    timer_ptr = t.CPtr(timer._ptr)
+
+    # 初始化组件统计
+    SetTextPtrs(big._ptr, sub._ptr, desc._ptr, lh._ptr, h2._ptr, h2b._ptr, h3._ptr, s3._ptr, h4._ptr, ok._ptr, fsum._ptr, oh._ptr)
+    UpdateCompInfo()
+
+    GotoStep(0)
+    win.show()
+    return app.exec()

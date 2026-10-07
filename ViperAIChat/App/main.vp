@@ -1,0 +1,516 @@
+# ============================================================
+# main.vp — ViperAIChat：DeepSeek/OpenAI 兼容的桌面聊天客户端
+#
+# UI（微信/QQ 聊天气泡风格 + 深色主题，全局微软雅黑）:
+#   1) 顶部条：标题 + 右侧【设置】按钮（点按展开/收起配置面板）
+#   2) 配置面板（默认收起）：API Key（QLineEdit 密码回显，留空由用户填）、
+#      模型名（默认 deepseek-v4-flash）、API 地址（默认 DeepSeek 端点）
+#   3) 中部：QListWidget 气泡聊天区（自己=右侧绿色气泡，AI=左侧深灰气泡，
+#      错误=左侧暗红气泡），带滚动
+#   4) 底部输入条：输入框 +【发送】+【清空】
+#   5) 发送 = 异步（vthreading 后台线程）+ SSE 流式（requests/https
+#      post_stream，stream:true）：AI 回复逐段刷新进同一条气泡；
+#      期间【发送】禁用，QTimer 主线程轮询增量。
+#
+# 说明：气泡行由 vqt6 QListWidget.addBubble()/replaceLastBubble() 提供，
+#      需重建 vqt6 静态库 includes/vqt6/build/lib/libvqt6_bridge.a。
+# ============================================================
+
+import t
+from stdint import *
+import stdlib
+import stdio
+import string
+import memhub
+import vqt6
+import vthreading
+import requests
+import requests.https as rhttps
+import json
+import w32.win32memory as win32mem
+
+
+# ============================================================
+# 常量
+# ============================================================
+# CA bundle（HTTPS 证书链校验用）
+CA_BUNDLE: str = "D:/msys64/mingw64/etc/ssl/certs/ca-bundle.crt"
+DEFAULT_MODEL: str = "deepseek-v4-flash"
+DEFAULT_API_URL: str = "https://api.deepseek.com/chat/completions"
+
+# 气泡角色
+define WHO_USER = 1   # 自己：右侧绿色气泡
+define WHO_AI = 0     # AI：左侧深灰气泡
+define WHO_SYS = 2    # 系统/错误：左侧暗红气泡
+
+# 气泡最大宽度（超出自动换行）
+define BUBBLE_MAX_W = 430
+
+# 全局字体：微软雅黑（作用于整窗所有控件，含气泡）
+APP_FONT_QSS: str = '* { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; }'
+
+# 气泡 QSS（与 addBubble 的 hpad/vpad 参数匹配）
+USER_QSS: str = "background-color:#95EC69;color:#111111;border-radius:10px;padding:8px 14px;"
+AI_QSS: str = "background-color:#3A3C40;color:#ECECEC;border:1px solid #4A4C50;border-radius:10px;padding:8px 14px;"
+SYS_QSS: str = "background-color:#5C2E2E;color:#FFB4B4;border-radius:10px;padding:6px 12px;"
+
+# 请求/回复缓冲上限（与服务端流式回复体量对应）
+define CUR_MSG_CAP = 8192
+define RESP_CAP = 262144
+define PULL_CAP = 8192
+
+
+# ============================================================
+# 模块级全局
+# ============================================================
+_mbuddy: memhub.MemBuddy* = None   # requests/https 内存池
+_json_pool: memhub.MemPool* = None # json 解析内存池（保留：错误回退解析等）
+
+chat_list: vqt6.QListWidget* = None
+input_edit: vqt6.QLineEdit* = None
+key_edit: vqt6.QLineEdit* = None
+model_edit: vqt6.QLineEdit* = None
+url_edit: vqt6.QLineEdit* = None
+settings_panel: vqt6.QWidget* = None
+settings_btn: vqt6.QPushButton* = None
+
+settings_open: int = 0
+
+# ---- 异步流式状态 ----
+streaming_active: int = 0      # 1 = 后台线程流式请求中
+worker_handle: t.CPtr = None   # 后台线程句柄（结束时等待并关闭）
+send_ptr: t.CPtr = None        # 发送按钮原始指针（流式期间禁用）
+acc_len: sizet = 0          # 已累积的回复内容长度（resp_acc）
+resp_acc: t.CArray[char, 262144]   # AI 流式回复累积文本（UI 线程写）
+disp_buf: t.CArray[char, 262144]   # 刷新用（裁剪掉末尾不完整 UTF-8 字符）
+pull_tmp: t.CArray[char, 8192]     # 拉取增量用临时缓冲
+cur_url: t.CArray[char, 2048]      # 供后台线程读取的请求参数
+cur_key: t.CArray[char, 2048]
+cur_model: t.CArray[char, 256]
+cur_msg: t.CArray[char, 8192]
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+def AddBubble(msg: str, who: int):
+    """追加一条气泡。who: WHO_USER/WHO_AI/WHO_SYS。"""
+    if msg is None or string.strlen(msg) == 0:
+        msg = " "
+    if who == WHO_USER:
+        chat_list.addBubble(msg, USER_QSS, 1, BUBBLE_MAX_W, 28, 16)
+    elif who == WHO_SYS:
+        chat_list.addBubble(msg, SYS_QSS, 0, BUBBLE_MAX_W, 12, 12)
+    else:
+        chat_list.addBubble(msg, AI_QSS, 0, BUBBLE_MAX_W, 28, 16)
+
+
+def ReplaceStreamBubble(msg: str):
+    """把最后一条气泡替换为最新流式回复文本（AI 气泡样式）。"""
+    if msg is None or string.strlen(msg) == 0:
+        msg = "…"
+    chat_list.replaceLastBubble(msg, AI_QSS, 0, BUBBLE_MAX_W, 28, 16)
+
+
+def StreamRefresh():
+    """把累积回复裁剪掉末尾不完整 UTF-8 字符后刷新气泡（防流式切字显示 �）。"""
+    global acc_len
+    if acc_len == 0:
+        return
+    end: sizet = acc_len
+    while end > 0:
+        s: sizet = end - 1
+        while s > 0 and (resp_acc[s] & 0xC0) == 0x80:
+            s -= 1
+        lead: char = resp_acc[s]
+        need: sizet = 1
+        if (lead & 0xE0) == 0xC0:
+            need = 2
+        elif (lead & 0xF0) == 0xE0:
+            need = 3
+        elif (lead & 0xF8) == 0xF0:
+            need = 4
+        if end - s >= need:
+            break
+        end = s
+    if end == 0:
+        return  # 全是半截字符，等后续字节再显示
+    for j in range(end):
+        disp_buf[j] = resp_acc[j]
+    disp_buf[end] = 0
+    ReplaceStreamBubble(disp_buf)
+
+
+def JsonEscape(src: str, dst: str, cap: int) -> int:
+    """把 src 转义为可放入 JSON 字符串字面量的内容写入 dst（\\ " \\n \\r \\t）。"""
+    if src is None:
+        src = ""
+    if dst is None or cap <= 0:
+        return -1
+    i: int = 0
+    w: int = 0
+    while src[i] != 0:
+        ch: char = src[i]
+        if ch == '"' or ch == '\\':
+            if w + 2 >= cap: return -1
+            dst[w] = '\\'
+            dst[w + 1] = ch
+            w += 2
+        elif ch == '\n':
+            if w + 2 >= cap: return -1
+            dst[w] = '\\'
+            dst[w + 1] = 'n'
+            w += 2
+        elif ch == '\r':
+            if w + 2 >= cap: return -1
+            dst[w] = '\\'
+            dst[w + 1] = 'r'
+            w += 2
+        elif ch == '\t':
+            if w + 2 >= cap: return -1
+            dst[w] = '\\'
+            dst[w + 1] = 't'
+            w += 2
+        else:
+            if w + 1 >= cap: return -1
+            dst[w] = ch
+            w += 1
+        i += 1
+    if w + 1 >= cap:
+        return -1
+    dst[w] = 0
+    return 0
+
+
+def _CopyStr(dst: str, src: str, cap: int):
+    """拷贝字符串到定长缓冲（自动补 0）。"""
+    if dst is None or cap <= 0:
+        return
+    n: int = 0
+    if src is not None:
+        while n < cap - 1 and src[n] != 0:
+            dst[n] = src[n]
+            n += 1
+    dst[n] = 0
+
+
+# ============================================================
+# 回调
+# ============================================================
+def OnToggleSettings(slot_id: int, data: t.CPtr):
+    """【设置】按钮：展开/收起顶部配置面板。"""
+    global settings_open
+    settings_open = 1 - settings_open
+    if settings_open != 0:
+        settings_panel.show()
+        settings_btn.setText("收起配置")
+    else:
+        settings_panel.hide()
+        settings_btn.setText("设置")
+
+
+def StreamWorker(arg: t.CPtr) -> t.CPtr:
+    """后台线程：发送 stream:true 请求并阻塞接收（SSE 增量由 https 库抽取）。"""
+    # 读配置与消息（主线程已拷贝到模块数组）
+    esc_buf: str = stdlib.malloc(CUR_MSG_CAP * 2 + 64)
+    body_buf: str = stdlib.malloc(32768)
+    auth_buf: str = stdlib.malloc(2048)
+    if esc_buf is None or body_buf is None or auth_buf is None:
+        if esc_buf is not None: stdlib.free(esc_buf)
+        if body_buf is not None: stdlib.free(body_buf)
+        if auth_buf is not None: stdlib.free(auth_buf)
+        return t.CPtr(0)
+
+    if JsonEscape(cur_msg, esc_buf, CUR_MSG_CAP * 2 + 64) == 0:
+        stdio.snprintf(auth_buf, 2048, "Bearer %s", cur_key)
+        stdio.snprintf(body_buf, 32768,
+            '{"model":"%s","messages":[{"role":"user","content":"%s"}],"stream":true}',
+            cur_model, esc_buf)
+        rhttps.post_stream(cur_url, body_buf, "application/json", True, CA_BUNDLE, auth_buf)
+
+    stdlib.free(esc_buf)
+    stdlib.free(body_buf)
+    stdlib.free(auth_buf)
+    return t.CPtr(0)
+
+
+def OnSend(slot_id: int, data: t.CPtr):
+    """发送：校验配置 → 起后台线程做流式请求（不阻塞 UI）。"""
+    global streaming_active, worker_handle, acc_len
+    if streaming_active != 0:
+        return  # 上一轮还在回复中
+
+    msg: str = input_edit.text()
+    if msg is None or string.strlen(msg) == 0:
+        return
+
+    key_txt: str = key_edit.text()
+    model_txt: str = model_edit.text()
+    url_txt: str = url_edit.text()
+
+    if key_txt is None or string.strlen(key_txt) == 0:
+        AddBubble("【配置错误】请先填写 API Key（点右上角【设置】）。", WHO_SYS)
+        return
+    if model_txt is None or string.strlen(model_txt) == 0:
+        AddBubble("【配置错误】模型名不能为空。", WHO_SYS)
+        return
+    if url_txt is None or string.strlen(url_txt) == 0:
+        AddBubble("【配置错误】API 地址不能为空。", WHO_SYS)
+        return
+
+    input_edit.clear()
+    AddBubble(msg, WHO_USER)  # 自己：右侧绿色气泡
+
+    # 拷贝请求参数到模块数组（后台线程读；主线程此后再写前会等本轮结束）
+    _CopyStr(cur_url, url_txt, 2048)
+    _CopyStr(cur_key, key_txt, 2048)
+    _CopyStr(cur_model, model_txt, 256)
+    _CopyStr(cur_msg, msg, CUR_MSG_CAP)
+    acc_len = 0
+    resp_acc[0] = 0
+
+    # 流式回复占位气泡 + 起后台线程
+    rhttps.stream_begin()
+    AddBubble("…", WHO_AI)
+    vqt6.vqt6_qwidget_set_enabled(send_ptr, 0)  # 发送期间禁用
+    streaming_active = 1
+
+    th = vthreading.Thread(StreamWorker, t.CPtr(0))
+    th.start()
+    worker_handle = t.CPtr(th.handle)
+
+
+def OnStreamTick(slot_id: int, data: t.CPtr):
+    """QTimer：主线程增量拉取流式内容并刷新 AI 气泡；结束时收尾。"""
+    global streaming_active, acc_len, worker_handle
+    if streaming_active == 0:
+        return
+
+    # 拉取新内容
+    n: INT = rhttps.stream_pull(pull_tmp, PULL_CAP)
+    if n > 0:
+        i: sizet = 0
+        while i < sizet(n) and acc_len < sizet(RESP_CAP) - 1:
+            resp_acc[acc_len] = pull_tmp[i]
+            acc_len += 1
+            i += 1
+        resp_acc[acc_len] = 0
+        StreamRefresh()
+
+    st: INT = rhttps.stream_state()
+    if st == 0:
+        return  # 仍在接收
+
+    # ---- 结束：最终拉取 + 收尾 ----
+    n2: INT = rhttps.stream_pull(pull_tmp, PULL_CAP)
+    if n2 > 0:
+        i2: sizet = 0
+        while i2 < sizet(n2) and acc_len < sizet(RESP_CAP) - 1:
+            resp_acc[acc_len] = pull_tmp[i2]
+            acc_len += 1
+            i2 += 1
+        resp_acc[acc_len] = 0
+        StreamRefresh()
+
+    if st == 1:
+        if acc_len == 0:
+            ReplaceStreamBubble("（空回复）")
+    else:
+        # 2 = 失败
+        err_txt: str = rhttps.stream_error_text()
+        if err_txt is None or string.strlen(err_txt) == 0:
+            err_txt = rhttps.last_error()
+        if err_txt is None or string.strlen(err_txt) == 0:
+            err_txt = "未知网络/证书错误"
+        ebuf: str = stdlib.malloc(1024)
+        if ebuf is not None:
+            stdio.snprintf(ebuf, 1024, "【请求失败】%s", err_txt)
+            AddBubble(ebuf, WHO_SYS)
+            stdlib.free(ebuf)
+        else:
+            AddBubble("【请求失败】", WHO_SYS)
+
+    streaming_active = 0
+    vqt6.vqt6_qwidget_set_enabled(send_ptr, 1)
+    if worker_handle is not None:
+        vthreading.wait_handle(worker_handle, 2000)
+        vthreading.close_handle(worker_handle)
+        worker_handle = None
+
+
+def OnClearHistory(slot_id: int, data: t.CPtr):
+    """清空聊天历史（流式中提示不可清）。"""
+    if streaming_active != 0:
+        AddBubble("正在回复中，稍后再清空。", WHO_SYS)
+        return
+    chat_list.clear()
+
+
+# ============================================================
+# 主入口
+# ============================================================
+@t.CExport
+def main() -> int:
+    global _mbuddy, _json_pool
+    global chat_list, input_edit, key_edit, model_edit, url_edit
+    global settings_panel, settings_btn, send_ptr
+
+    # ---- 内存池：requests(16MB) + json(4MB) ----
+    http_arena: bytes = stdlib.malloc(16 * 1024 * 1024)
+    if http_arena is None:
+        return 1
+    _mbuddy = memhub.MemBuddy(http_arena, 16 * 1024 * 1024)
+    requests._mbuddy = _mbuddy
+
+    json_mem: t.CPtr = win32mem.VirtualAlloc(0, 4 * 1024 * 1024, 0x3000, 0x04)
+    if json_mem is None:
+        return 1
+    _json_pool = memhub.MemPool(json_mem, 4 * 1024 * 1024)
+
+    # ---- 应用与主窗口 ----
+    app = vqt6.QApplication([])
+    win = vqt6.QMainWindow()
+    win.setWindowTitle("Viper AI Chat")
+    win.resize(900, 680)
+
+    central = vqt6.QWidget()
+    win.setCentralWidget(central._ptr)
+
+    vroot = vqt6.QVBoxLayout(central)
+    vroot.setContentsMargins(0, 0, 0, 0)
+    vroot.setSpacing(0)
+
+    # ============================================================
+    # 顶部条：标题 + 【设置】
+    # ============================================================
+    hdr = vqt6.QWidget()
+    hdr.setStyleSheet("QWidget { background-color:#2A2B2E; border-bottom:1px solid #3F4045; }")
+    hrow = vqt6.QHBoxLayout(hdr)
+    hrow.setContentsMargins(14, 8, 12, 8)
+    hrow.setSpacing(8)
+
+    title_lb = vqt6.QLabel("Viper AI Chat")
+    title_lb.setStyleSheet("color:#F2F2F2;font-size:16px;font-weight:600;background:transparent;")
+    hrow.addWidget(title_lb._ptr)
+    hrow.addStretch(1)
+
+    _st_btn = vqt6.QPushButton("设置")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(_st_btn._ptr,
+        "QPushButton { background:#33353A; color:#B9C8F0; border:1px solid #4A4C52; border-radius:13px; padding:3px 14px; font-size:13px; }"
+        " QPushButton:hover { background:#3E4046; } QPushButton:pressed { background:#484B52; }")
+    _st_btn.clicked(OnToggleSettings, 0)
+    hrow.addWidget(_st_btn._ptr)
+    settings_btn = _st_btn
+    vroot.addWidget(hdr._ptr)
+
+    # ============================================================
+    # 配置面板（默认收起）
+    # ============================================================
+    _panel = vqt6.QWidget()
+    _panel.setStyleSheet("QWidget { background-color:#222326; border-bottom:1px solid #3F4045; }")
+    pv = vqt6.QVBoxLayout(_panel)
+    pv.setContentsMargins(14, 8, 14, 10)
+    pv.setSpacing(6)
+    settings_panel = _panel
+
+    prow1 = vqt6.QHBoxLayout()
+    plb1 = vqt6.QLabel("API Key:")
+    plb1.setStyleSheet("color:#B8B8BC;font-size:13px;background:transparent;")
+    prow1.addWidget(plb1._ptr)
+    _key_le = vqt6.QLineEdit("")
+    _key_le.setPlaceholderText("sk-... 填入 API Key（留空不默认写 Key）")
+    vqt6.vqt6_qlineedit_set_echo_mode(_key_le._ptr, 2)  # Password = 2
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(_key_le._ptr,
+        "QLineEdit { background:#2E2F34; color:#ECECEC; border:1px solid #484A50; border-radius:6px; padding:4px 8px; font-size:13px; selection-background-color:#95EC69; selection-color:#111111; }")
+    prow1.addWidget(_key_le._ptr)
+    key_edit = _key_le
+    pv.addLayout(prow1._ptr)
+
+    prow2 = vqt6.QHBoxLayout()
+    plb2 = vqt6.QLabel("模型:")
+    plb2.setStyleSheet("color:#B8B8BC;font-size:13px;background:transparent;")
+    prow2.addWidget(plb2._ptr)
+    _model_le = vqt6.QLineEdit(DEFAULT_MODEL)
+    _model_le.setPlaceholderText("默认 deepseek-v4-flash")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(_model_le._ptr,
+        "QLineEdit { background:#2E2F34; color:#ECECEC; border:1px solid #484A50; border-radius:6px; padding:4px 8px; font-size:13px; selection-background-color:#95EC69; selection-color:#111111; }")
+    prow2.addWidget(_model_le._ptr)
+    model_edit = _model_le
+    pv.addLayout(prow2._ptr)
+
+    prow3 = vqt6.QHBoxLayout()
+    plb3 = vqt6.QLabel("API 地址:")
+    plb3.setStyleSheet("color:#B8B8BC;font-size:13px;background:transparent;")
+    prow3.addWidget(plb3._ptr)
+    _url_le = vqt6.QLineEdit(DEFAULT_API_URL)
+    _url_le.setPlaceholderText("https://.../chat/completions")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(_url_le._ptr,
+        "QLineEdit { background:#2E2F34; color:#ECECEC; border:1px solid #484A50; border-radius:6px; padding:4px 8px; font-size:13px; selection-background-color:#95EC69; selection-color:#111111; }")
+    prow3.addWidget(_url_le._ptr)
+    url_edit = _url_le
+    pv.addLayout(prow3._ptr)
+
+    vroot.addWidget(_panel._ptr)
+    _panel.hide()
+
+    # ============================================================
+    # 中部：气泡聊天区（QListWidget）
+    # ============================================================
+    _chat = vqt6.QListWidget()
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(_chat._ptr,
+        "QListWidget { background-color:#161719; border:none; outline:0; }"
+        " QListWidget::item { background:transparent; border:none; }"
+        " QListWidget::item:hover { background:transparent; }"
+        " QListWidget::item:selected { background:transparent; color:#ECECEC; }"
+        " QScrollBar:vertical { background:#161719; width:8px; margin:0; }"
+        " QScrollBar::handle:vertical { background:#4A4B50; border-radius:4px; min-height:30px; }"
+        " QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0px; }"
+        " QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:#161719; }")
+    vroot.addWidget(_chat._ptr)
+    chat_list = _chat
+
+    # ============================================================
+    # 底部输入条
+    # ============================================================
+    inbar = vqt6.QWidget()
+    inbar.setStyleSheet("QWidget { background-color:#2A2B2E; border-top:1px solid #3F4045; }")
+    irow = vqt6.QHBoxLayout(inbar)
+    irow.setContentsMargins(12, 8, 12, 8)
+    irow.setSpacing(8)
+
+    _in_le = vqt6.QLineEdit("")
+    _in_le.setPlaceholderText("输入消息，点击【发送】")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(_in_le._ptr,
+        "QLineEdit { background:#2E2F34; color:#ECECEC; border:1px solid #484A50; border-radius:18px; padding:6px 14px; font-size:14px; selection-background-color:#95EC69; selection-color:#111111; }")
+    irow.addWidget(_in_le._ptr)
+    input_edit = _in_le
+
+    send_btn = vqt6.QPushButton("发送")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(send_btn._ptr,
+        "QPushButton { background-color:#07C160; color:#FFFFFF; border:none; border-radius:18px; padding:6px 26px; font-size:14px; font-weight:600; }"
+        " QPushButton:hover { background-color:#06AD56; } QPushButton:pressed { background-color:#059B4C; }")
+    send_btn.clicked(OnSend, 0)
+    irow.addWidget(send_btn._ptr)
+    send_ptr = t.CPtr(send_btn._ptr)
+
+    clear_btn = vqt6.QPushButton("清空")
+    vqt6.vqt6_qwidget_set_stylesheet_utf8(clear_btn._ptr,
+        "QPushButton { background:transparent; color:#8A8B90; border:none; padding:0 8px; font-size:13px; }"
+        " QPushButton:hover { color:#C0C4F0; }")
+    clear_btn.clicked(OnClearHistory, 0)
+    irow.addWidget(clear_btn._ptr)
+    vroot.addWidget(inbar._ptr)
+
+    # ---- 流式刷新定时器 ----
+    _st_timer = vqt6.QTimer()
+    _st_timer.timeout(OnStreamTick, 0)
+    _st_timer.start(40)
+
+    # ---- 全局微软雅黑 ----
+    central.setStyleSheet(APP_FONT_QSS)
+
+    win.show()
+
+    AddBubble("你好，我是 Viper AI。点右上角【设置】填入 API Key 后即可开始对话。", WHO_AI)
+
+    return app.exec()

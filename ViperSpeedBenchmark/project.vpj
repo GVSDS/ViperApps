@@ -1,0 +1,39 @@
+{
+    "name": "ViperSpeedBenchmark",
+    "version": "1.0.0",
+    "description": "同内核多实现测速基准: out[i]=a[i]*b[i]+c[i] (len=16384, iters=65536, 每次run≈2.147e9 flops; 工作集512KiB 常驻私有L2)。Viper 侧第4个命令行参数 mode 可切 8 个内核: FMA/ADD/MUL/SQRT 各一对 SIMD(simd_*_array) 与 原生(scalar_*_array), 用于 SIMD 加速比对照; mode=0 的 FMA SIMD 与 C/C++/Python 对齐",
+    "source_dir": "./App",
+    "build_dir": "./.tpv_build",
+    "compiler": {
+        "cmd": "llc",
+        "flags": [
+            "-filetype=obj"
+        ]
+    },
+    "linker": {
+        "cmd": "D:/msys64/mingw64/bin/clang++.exe",
+        "flags": [
+            "-fuse-ld=lld",
+            "-O2",
+            "-lmsvcrt",
+            "-lpthread",
+            "-lmingwex",
+            "-lkernel32",
+            "-Wl,--stack,0x1000000"
+        ],
+        "output": "app.exe"
+    },
+    "includes": [
+        "../../includes"
+    ],
+    "target": {
+        "triple": "x86_64-pc-windows-gnu",
+        "datalayout": "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+    },
+    "options": {
+        "slice_level": 3,
+        "sha1_slice_level": 1,
+        "target": "llvm",
+        "strict_mode": true
+    }
+}

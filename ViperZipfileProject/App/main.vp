@@ -1,0 +1,315 @@
+# main.vp — ViperZipfileProject: zipfile module read/write test
+#
+# Coverage:
+#   1) ZipFile("w") writes 4 members (deflate text / deflate large file / stored pseudo-random / empty file)
+#   2) ZipFile("r") reads back: entry count / name / size / compress_size checks + per-member content compare
+#      (CRC32 verification is done inside zipfile.read)
+#   3) Corrupt one payload byte of a stored member -> a second read must return None with error ZIP_ERR_CRC
+import t, c
+from stdint import *
+import stdio
+import stdlib
+import string
+import zipfile
+import w32.win32base as wb
+import w32.win32file as wf
+
+
+ZIP_PATH: str = "zip_roundtrip.zip"
+BIG_LEN: sizet = 100000
+RND_LEN: sizet = 5000
+HELLO_TEXT: str = "Hello, Viper Zipfile!\n"
+
+fail_count: int = 0
+
+
+def chk(name: str, cond: int):
+    global fail_count
+    if cond:
+        stdio.printf("[PASS] %s\n", name)
+    else:
+        fail_count += 1
+        stdio.printf("[FAIL] %s\n", name)
+    stdio.fflush(None)   # keep printed lines visible even on crash (stdout is fully buffered)
+
+
+def StrLen(s: bytes) -> sizet:
+    n: sizet = 0
+    while s is not None and *s != 0:
+        n += 1
+        s += 1
+    return n
+
+
+def fill_pattern(buf: bytes, length: sizet, kind: int):
+    for i in range(length):
+        if kind == 1:
+            # 'A'..'G' cycle - highly compressible
+            buf[i] = 65 + (i % 7)
+        else:
+            # pseudo-random - for the ZIP_STORED member
+            buf[i] = (i * 37 + 11) & 0xFF
+
+
+def WriteZip() -> int:
+    stdio.printf("\n--- 1) write zip (4 members) ---\n")
+    wf.DeleteFileA(ZIP_PATH)
+    w: zipfile.ZipFile* = zipfile.ZipFile(ZIP_PATH, "w", zipfile.ZIP_DEFLATED)
+    if w.ok == 0:
+        stdio.printf("open(w) failed: %s\n", zipfile.error())
+        return 1
+
+    hello: bytes = stdlib.malloc(64)
+    if not hello:
+        stdio.printf("malloc hello failed\n")
+        w.close()
+        return 1
+    string.strcpy(hello, HELLO_TEXT)
+    hello_len: sizet = StrLen(hello)
+
+    big: bytes = stdlib.malloc(BIG_LEN)
+    if not big:
+        stdio.printf("malloc big failed\n")
+        stdlib.free(hello)
+        w.close()
+        return 1
+    fill_pattern(big, BIG_LEN, 1)
+
+    rnd: bytes = stdlib.malloc(RND_LEN)
+    if not rnd:
+        stdio.printf("malloc rnd failed\n")
+        stdlib.free(hello)
+        stdlib.free(big)
+        w.close()
+        return 1
+    fill_pattern(rnd, RND_LEN, 0)
+
+    rc: int = w.write("hello.txt", hello, hello_len, zipfile.ZIP_DEFLATED)
+    chk("write hello.txt (deflate)", rc == zipfile.ZIP_ERR_OK)
+    if rc != zipfile.ZIP_ERR_OK:
+        stdio.printf("    hello err: %s\n", zipfile.error())
+    rc = w.write("big.bin", big, BIG_LEN, zipfile.ZIP_DEFLATED)
+    chk("write big.bin (deflate, 100000B)", rc == zipfile.ZIP_ERR_OK)
+    if rc != zipfile.ZIP_ERR_OK:
+        stdio.printf("    big err: %s\n", zipfile.error())
+    rc = w.write("random.bin", rnd, RND_LEN, zipfile.ZIP_STORED)
+    chk("write random.bin (stored)", rc == zipfile.ZIP_ERR_OK)
+    if rc != zipfile.ZIP_ERR_OK:
+        stdio.printf("    random err: %s\n", zipfile.error())
+    rc = w.write("empty.txt", None, 0, zipfile.ZIP_DEFLATED)
+    chk("write empty.txt (deflate, 0B)", rc == zipfile.ZIP_ERR_OK)
+    if rc != zipfile.ZIP_ERR_OK:
+        stdio.printf("    empty err: %s\n", zipfile.error())
+    rc = w.close()
+    chk("close(w)", rc == zipfile.ZIP_ERR_OK)
+    if rc != zipfile.ZIP_ERR_OK:
+        stdio.printf("    close err: %s\n", zipfile.error())
+
+    # After close, confirm the on-disk size with a raw file handle (independent of zipfile read logic)
+    ph: wb.HANDLE = wf.CreateFileA(
+        ZIP_PATH, wf.GENERIC_READ,
+        wf.FILE_SHARE_READ | wf.FILE_SHARE_WRITE | wf.FILE_SHARE_DELETE,
+        None, wf.OPEN_EXISTING, wf.FILE_ATTRIBUTE_NORMAL, None)
+    if ph == wb.INVALID_HANDLE_VALUE:
+        stdio.printf("probe open failed: err=%u\n", wb.GetLastError())
+    else:
+        pli: wb.LARGE_INTEGER = wb.LARGE_INTEGER()
+        if wf.GetFileSizeEx(ph, t.CPtr(&pli)) != 0:
+            stdio.printf("zip file size on disk = %lld\n", pli.QuadPart)
+        wb.CloseHandle(ph)
+
+    stdlib.free(hello)
+    stdlib.free(big)
+    stdlib.free(rnd)
+    return 0
+
+
+def CheckReadBack(buf: bytes, expect: bytes, length: sizet) -> int:
+    # buf: decompressed buffer returned by zipfile.read; expect: expected content
+    if buf is None:
+        return 0
+    if length == 0:
+        return 1
+    return int(string.memcmp(buf, expect, length) == 0)
+
+
+def ReadZip() -> int:
+    stdio.printf("\n--- 2) read-back verification ---\n")
+    r: zipfile.ZipFile* = zipfile.ZipFile(ZIP_PATH, "r")
+    if r.ok == 0:
+        stdio.printf("open(r) failed: %s\n", zipfile.error())
+        return 1
+
+    chk("entry count == 4", r.info_count == 4)
+    for i in range(r.info_count):
+        stdio.printf("  [%d] %s\n", int(i), r.namelist_at(i))
+
+    # ---- hello.txt: deflate text ----
+    info: zipfile.ZipInfo* = r.getinfo("hello.txt")
+    chk("getinfo(hello.txt)", info is not None)
+    hello_expect: bytes = stdlib.malloc(64)
+    string.strcpy(hello_expect, HELLO_TEXT)
+    exp_len: sizet = StrLen(hello_expect)
+    if info is not None:
+        chk("hello file_size == 22", info.file_size == exp_len)
+        chk("hello compress_size > 0", info.compress_size > 0)
+    olen: sizet = 0
+    data: bytes = r.read("hello.txt", &olen)
+    chk("read(hello.txt)", data is not None)
+    chk("hello content match", CheckReadBack(data, hello_expect, olen) == 1)
+    stdlib.free(data)
+    stdlib.free(hello_expect)
+
+    # ---- big.bin: deflate large file ----
+    info = r.getinfo("big.bin")
+    chk("getinfo(big.bin)", info is not None)
+    big_expect: bytes = stdlib.malloc(BIG_LEN)
+    fill_pattern(big_expect, BIG_LEN, 1)
+    if info is not None:
+        chk("big file_size == 100000", info.file_size == BIG_LEN)
+        chk("big compress_size < file_size", info.compress_size < info.file_size)
+        chk("big crc != 0", info.crc32 != 0)
+    olen = 0
+    data = r.read("big.bin", &olen)
+    chk("read(big.bin)", data is not None)
+    chk("big content match", data is not None and olen == BIG_LEN
+        and CheckReadBack(data, big_expect, BIG_LEN) == 1)
+    stdlib.free(data)
+    stdlib.free(big_expect)
+
+    # ---- random.bin: stored ----
+    info = r.getinfo("random.bin")
+    chk("getinfo(random.bin)", info is not None)
+    rnd_expect: bytes = stdlib.malloc(RND_LEN)
+    fill_pattern(rnd_expect, RND_LEN, 0)
+    if info is not None:
+        chk("random file_size == 5000", info.file_size == RND_LEN)
+        chk("random stored: compress_size == file_size", info.compress_size == info.file_size)
+    olen = 0
+    data = r.read("random.bin", &olen)
+    chk("read(random.bin)", data is not None)
+    chk("random content match", data is not None and olen == RND_LEN
+        and CheckReadBack(data, rnd_expect, RND_LEN) == 1)
+    stdlib.free(data)
+    stdlib.free(rnd_expect)
+
+    # ---- empty.txt: empty member ----
+    info = r.getinfo("empty.txt")
+    chk("getinfo(empty.txt)", info is not None)
+    olen = 0
+    data = r.read("empty.txt", &olen)
+    chk("read(empty.txt) ok", data is not None)
+    chk("empty length == 0", olen == 0)
+    stdlib.free(data)
+
+    # ---- Missing member ----
+    olen = 0
+    data = r.read("no_such.txt", &olen)
+    chk("read(missing) returns None", data is None)
+    chk("read(missing) code NOT_FOUND", zipfile.error_code() == zipfile.ZIP_ERR_NOT_FOUND)
+
+    rc: int = r.close()
+    chk("close(r)", rc == zipfile.ZIP_ERR_OK)
+    return 0
+
+
+def CorruptStoredCheck() -> int:
+    stdio.printf("\n--- 3) CRC check after corrupting a stored member ---\n")
+    r: zipfile.ZipFile* = zipfile.ZipFile(ZIP_PATH, "r")
+    if r.ok == 0:
+        stdio.printf("open(r) failed: %s\n", zipfile.error())
+        return 1
+    info: zipfile.ZipInfo* = r.getinfo("random.bin")
+    chk("getinfo(random.bin)", info is not None)
+    if info is None or info.compress_size < 2:
+        stdio.printf("cannot locate stored member payload\n")
+        r.close()
+        return 1
+
+    # With no extra field in the local header, data starts at header_offset + 30 + name_len
+    start: sizet = sizet(info.header_offset) + 30 + info.name_len
+    flip_pos: sizet = start + info.compress_size - 1
+
+    # Approach: read the whole file into memory -> flip the last stored data byte -> rewrite the whole file (reusing the verified read/write loop)
+    hr: wb.HANDLE = wf.CreateFileA(
+        ZIP_PATH, wf.GENERIC_READ,
+        wf.FILE_SHARE_READ | wf.FILE_SHARE_WRITE | wf.FILE_SHARE_DELETE,
+        None, wf.OPEN_EXISTING, wf.FILE_ATTRIBUTE_NORMAL, None)
+    chk("open R", hr != wb.INVALID_HANDLE_VALUE)
+    if hr != wb.INVALID_HANDLE_VALUE:
+        fsz_li: wb.LARGE_INTEGER = wb.LARGE_INTEGER()
+        if wf.GetFileSizeEx(hr, t.CPtr(&fsz_li)) == 0 or fsz_li.QuadPart <= 0:
+            chk("get file size", 0)
+            wb.CloseHandle(hr)
+            r.close()
+            return 1
+        fsz: sizet = sizet(fsz_li.QuadPart)
+        whole: BYTEPTR = BYTEPTR(stdlib.malloc(fsz))
+        if not whole:
+            wb.CloseHandle(hr)
+            r.close()
+            return 1
+        # Read the whole file
+        done: sizet = 0
+        rd_ok: int = 1
+        while done < fsz:
+            rdgot: ULONG = 0
+            if wf.ReadFile(hr, whole + done, ULONG(fsz - done), &rdgot, None) == 0 or rdgot == 0:
+                rd_ok = 0
+                break
+            done += sizet(rdgot)
+        wb.CloseHandle(hr)
+        chk("read whole file", rd_ok == 1)
+        if rd_ok == 1 and flip_pos < fsz:
+            stdio.printf("  flip stored data byte at %lld (size=%lld)\n", flip_pos, fsz_li.QuadPart)
+            whole[flip_pos] = (whole[flip_pos] ^ 0xFF) & 0xFF
+            # Rewrite the whole file
+            hw: wb.HANDLE = wf.CreateFileA(
+                ZIP_PATH, wf.GENERIC_WRITE,
+                wf.FILE_SHARE_READ | wf.FILE_SHARE_WRITE | wf.FILE_SHARE_DELETE,
+                None, wf.CREATE_ALWAYS, wf.FILE_ATTRIBUTE_NORMAL, None)
+            chk("open W rewrite", hw != wb.INVALID_HANDLE_VALUE)
+            if hw != wb.INVALID_HANDLE_VALUE:
+                wr_ok: int = 1
+                wdone: sizet = 0
+                while wdone < fsz:
+                    wrgot: ULONG = 0
+                    if wf.WriteFile(hw, whole + wdone, ULONG(fsz - wdone), &wrgot, None) == 0 or wrgot == 0:
+                        wr_ok = 0
+                        break
+                    wdone += sizet(wrgot)
+                wb.CloseHandle(hw)
+                chk("rewrite file with flipped byte", wr_ok == 1)
+        else:
+            chk("flip position in bounds", 0)
+        stdlib.free(whole)
+    r.close()
+
+    z2: zipfile.ZipFile* = zipfile.ZipFile(ZIP_PATH, "r")
+    chk("reopen after corruption", z2.ok == 1)
+    olen: sizet = 0
+    data: bytes = z2.read("random.bin", &olen)
+    chk("corrupted read returns None", data is None)
+    chk("error code == ZIP_ERR_CRC", zipfile.error_code() == zipfile.ZIP_ERR_CRC)
+    stdio.printf("  last error: %s\n", zipfile.error())
+    if data is not None:
+        stdlib.free(data)
+    z2.close()
+    return 0
+
+
+@t.CExport
+def main() -> int:
+    stdio.printf("ViperZipfileProject: zipfile module read/write test\n")
+    if WriteZip() != 0:
+        return 1
+    if ReadZip() != 0:
+        return 1
+    if CorruptStoredCheck() != 0:
+        return 1
+
+    wf.DeleteFileA(ZIP_PATH)
+    stdio.printf("\nFailures: %d\n", fail_count)
+    if fail_count == 0:
+        stdio.printf("ALL PASSED\n")
+    return int(fail_count != 0)

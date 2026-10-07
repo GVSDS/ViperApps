@@ -1,0 +1,293 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# ViperMNIST - 28x28 手写数字识别(MLP / CNN, torch-lite)
+#
+# 入口分发:
+#   * 无命令行参数            → 启动 Qt6 图形面板(数据/训练/推理, 含 3D 网络图)
+#   * 带命令行参数            → 走原 CLI(train / use)
+#
+# CLI 用法:
+#   app.exe --mode train --data-dir data --epochs 5 --batch 64 --lr 0.01 \
+#           --hidden 256 --save models/mnist.bin --limit 60000
+#   app.exe --mode train --arch cnn --c1 8 --c2 16     (卷积 + 池化, 更抗形变)
+#   app.exe --mode use   --data-dir data --load models/mnist.bin --show 10
+#   --download 自动下载缺失数据; --file 指定本地已下载 .gz(可 1~2 次)
+#   --no-aug 关闭数据增强(默认开: 训练时随机平移 ±2px)
+#   注: use 模式的架构/hidden/通道以模型文件头为准, 无需与命令行走一致
+#
+# 模型: MLP = Linear(784->hidden) -> ReLU -> Linear(hidden->10)
+#       CNN = Conv(1->c1,3x3,pad1) -> ReLU -> MaxPool2 -> Conv(c1->c2,3x3,pad1)
+#             -> ReLU -> MaxPool2 -> Linear(49*c2->hidden) -> ReLU -> Linear(hidden->10)
+#   权重形状同 PyTorch: Conv(out,in,k,k) / Linear(out,in), b(out)
+# 计算: torch-lite 线性前向走 vipersimd.simd_dot4d, relu 走 simd_max4d
+# ============================================================
+import t, c
+from stdint import *
+import stdlib
+import string
+import stdio
+import sys
+import memhub
+import argparse
+import requests
+import torch
+import w32.win32console as w32cmd
+import lib.MnistData as MnistData
+import lib.MnistNet as MnistNet
+import lib.AppGui as AppGui
+
+define CODE_PAGE = 65001   # UTF-8 控制台
+
+# 主内存池(CLI 与 GUI 共用)
+define POOL_SIZE = 536870912   # 512 MB
+
+
+# ============================================================
+# CLI
+# ============================================================
+def run_cli(pool: memhub.MemBuddy*) -> int:
+    parser: argparse.ArgumentParser* = argparse.ArgumentParser(
+        "ViperMNIST", "28x28 MNIST 手写数字识别 (train/use)", pool=pool)
+    parser.add_argument("--mode", None, argparse.STRING, 0, "train", False,
+                        argparse.STORE, "train=训练 / use=加载模型推理")
+    parser.add_argument("--data-dir", None, argparse.STRING, 0, "data", False,
+                        argparse.STORE, "MNIST IDX 文件所在目录")
+    parser.add_argument("--epochs", None, argparse.INT, 5, None, False,
+                        argparse.STORE, "训练轮数")
+    parser.add_argument("--batch", None, argparse.INT, 64, None, False,
+                        argparse.STORE, "批大小")
+    parser.add_argument("--lr", None, argparse.STRING, 0, "0.01", False,
+                        argparse.STORE, "学习率(小数; 训练用重球法, 默认 0.01)")
+    parser.add_argument("--hidden", None, argparse.INT, 256, None, False,
+                        argparse.STORE, "隐藏层宽度(CNN 下为 FC1 宽度)")
+    parser.add_argument("--arch", None, argparse.STRING, 0, "mlp", False,
+                        argparse.STORE, "架构: mlp=全连接 / cnn=卷积+池化")
+    parser.add_argument("--c1", None, argparse.INT, 8, None, False,
+                        argparse.STORE, "CNN conv1 通道数(仅 --arch cnn 生效)")
+    parser.add_argument("--c2", None, argparse.INT, 16, None, False,
+                        argparse.STORE, "CNN conv2 通道数(仅 --arch cnn 生效)")
+    parser.add_argument("--no-aug", None, argparse.BOOL, 0, None, False,
+                        argparse.STORE_TRUE, "关闭数据增强(默认开启: 训练时随机平移 ±2px)")
+    parser.add_argument("--limit", None, argparse.INT, 0, None, False,
+                        argparse.STORE, "样本上限(0=全部)")
+    parser.add_argument("--save", None, argparse.STRING, 0, "mnist.bin",
+                        False, argparse.STORE, "训练保存路径")
+    parser.add_argument("--load", None, argparse.STRING, 0, "mnist.bin",
+                        False, argparse.STORE, "推理加载路径")
+    parser.add_argument("--show", None, argparse.INT, 10, None, False,
+                        argparse.STORE, "use 模式打印前 N 条预测")
+    parser.add_argument("--seed", None, argparse.INT, 42, None, False,
+                        argparse.STORE, "随机种子")
+    parser.add_argument("--download", None, argparse.BOOL, 0, None, False,
+                        argparse.STORE_TRUE, "自动下载缺失的 MNIST 数据")
+    parser.add_argument("--file", None, argparse.STRING, 0, None, False,
+                        argparse.STORE, "本地已下载的 .gz(可 1~2 次: 图像/标签各一份), 优先本地解压替代联网")
+    parser.add_argument("--help", "-h", argparse.BOOL, 0, None, False,
+                        argparse.STORE_TRUE, "显示帮助并退出")
+
+    args: argparse.ParsedArgs* = parser.parse_args(sys._argc, sys._argv)
+    if args is None:
+        stdio.printf("参数解析失败\n")
+        return 1
+    if args.get_bool("help"):
+        parser.print_help()
+        return 0
+
+    mode: str = args.get_str("mode")
+    data_dir: str = args.get_str("data-dir")
+    epochs: int = args.get_int("epochs")
+    batch: int = args.get_int("batch")
+    hidden: int = args.get_int("hidden")
+    limit: int = args.get_int("limit")
+    show: int = args.get_int("show")
+    seed: int = args.get_int("seed")
+    save_path: str = args.get_str("save")
+    load_path: str = args.get_str("load")
+    arch_str: str = args.get_str("arch")
+    c1_arg: int = args.get_int("c1")
+    c2_arg: int = args.get_int("c2")
+    lr_str: str = args.get_str("lr")
+    download: int = 0
+    if args.get_bool("download"):
+        download = 1
+    no_aug: int = 0
+    if args.get_bool("no-aug"):
+        no_aug = 1
+
+    # --file 本地 .gz(可 1~2 次): 按文件名含 -labels-/-images- 归类, 无名匹配按先后补空位
+    loc_im: str = None
+    loc_lb: str = None
+    i_arg: int = 1
+    while i_arg + 1 < sys._argc:
+        if string.strcmp(sys._argv[i_arg], "--file") == 0:
+            fv: str = sys._argv[i_arg + 1]
+            is_lb: int = 0
+            if string.strstr(fv, "-labels-") is not None:
+                is_lb = 1
+            is_im: int = 0
+            if string.strstr(fv, "-images-") is not None:
+                is_im = 1
+            if is_lb != 0 and is_im == 0 and loc_lb is None:
+                loc_lb = fv
+            elif is_im != 0 and is_lb == 0 and loc_im is None:
+                loc_im = fv
+            elif loc_im is None:
+                loc_im = fv
+            elif loc_lb is None:
+                loc_lb = fv
+            i_arg += 2
+        else:
+            i_arg += 1
+    file_set: int = 0
+    if loc_im is not None or loc_lb is not None:
+        file_set = 1
+
+    lr: double = double(0.01)
+    if lr_str is not None and string.strlen(lr_str) > 0:
+        lr = MnistData.atof(lr_str, lr)
+
+    MnistNet.rand_seed(uint64(seed))
+    torch.manual_seed(int64(seed))
+
+    h: sizet = sizet(hidden)
+    # 架构与数据增强: 与 GUI 口径一致(通道数只在 CNN 下有意义)
+    arch: int = MnistNet.ARCH_MLP
+    if string.strcmp(arch_str, "cnn") == 0 or string.strcmp(arch_str, "CNN") == 0:
+        arch = MnistNet.ARCH_CNN
+    c1: sizet = 0
+    c2: sizet = 0
+    if arch == MnistNet.ARCH_CNN:
+        c1 = sizet(c1_arg)
+        c2 = sizet(c2_arg)
+    augment: int = 1
+    if no_aug != 0:
+        augment = 0
+    stdio.printf("ViperMNIST  mode=%s  data=%s  limit=%d  hidden=%d  epochs=%d  batch=%d  lr=%.3f  arch=%s\n",
+                 mode, data_dir, limit, hidden, epochs, batch, lr, arch_str)
+
+    p_img: str = stdlib.malloc(1024)
+    p_lbl: str = stdlib.malloc(1024)
+
+    if string.strcmp(mode, "train") == 0:
+        net: MnistNet.Net* = MnistNet.Net(pool, h, sizet(arch), c1, c2)
+        if MnistNet.net_ok(net) == 0:
+            stdio.printf("FAIL: 网络分配失败\n")
+            return 1
+        MnistNet.init_net_weights(net)
+        MnistData.idx_paths(data_dir, 0, p_img, p_lbl)
+        if download != 0 or file_set != 0:
+            if MnistData.ensure_mnist(data_dir, 0, download, loc_im, loc_lb) != 0:
+                stdio.printf("数据就绪失败, 请检查 --file 路径 / 网络 / data-dir\n")
+                return 1
+        cap: sizet = sizet(60000)
+        if limit > 0 and limit < 60000:
+            cap = sizet(limit)
+        xbuf: double* = stdlib.malloc(cap * MnistData.N_IN * 8)
+        ybuf: int* = stdlib.malloc(cap * 4)
+        if xbuf is None or ybuf is None:
+            stdio.printf("FAIL: 训练数据缓冲分配失败\n")
+            return 1
+        n_im: sizet = MnistData.load_mnist_images(p_img, xbuf, cap)
+        n_lb: sizet = MnistData.load_mnist_labels(p_lbl, ybuf, cap)
+        n_tr: sizet = n_im
+        if n_lb < n_tr:
+            n_tr = n_lb
+        stdio.printf("加载训练样本=%zu 张  (%s)\n", n_tr, MnistNet.arch_name(arch))
+        if n_tr == 0:
+            stdio.printf("未找到可用数据。如 data 目录文件残缺/损坏, 请加 --download 重新拉取或用 --file 指定本地 .gz\n")
+            return 1
+        MnistNet.prog_init()
+        MnistNet.train_run(pool, net, xbuf, ybuf, n_tr,
+                           sizet(batch), sizet(epochs), lr, save_path, augment)
+        stdlib.free(xbuf)
+        stdlib.free(ybuf)
+    elif string.strcmp(mode, "use") == 0:
+        # 架构/hidden/通道以模型文件头为准(命令行给的对推理无意义), 先读头再建网
+        minfo: int* = stdlib.malloc(20)
+        if minfo is None:
+            stdio.printf("FAIL: 模型头缓冲分配失败\n")
+            return 1
+        if MnistNet.peek_model(load_path, minfo) == 0:
+            stdlib.free(minfo)
+            stdio.printf("加载模型失败, 请先训练(--mode train): %s\n", load_path)
+            return 1
+        f_arch: int = minfo[0]
+        f_hidden: int = minfo[1]
+        f_c1: int = minfo[2]
+        f_c2: int = minfo[3]
+        stdlib.free(minfo)
+        uh: sizet = sizet(f_hidden)
+        uc1: sizet = 0
+        uc2: sizet = 0
+        if f_arch == MnistNet.ARCH_CNN:
+            uc1 = sizet(f_c1)
+            uc2 = sizet(f_c2)
+        net2: MnistNet.Net* = MnistNet.Net(pool, uh, sizet(f_arch),
+                                                  uc1, uc2)
+        if MnistNet.net_ok(net2) == 0:
+            stdio.printf("FAIL: 网络分配失败\n")
+            return 1
+        MnistData.idx_paths(data_dir, 1, p_img, p_lbl)
+        if download != 0 or file_set != 0:
+            if MnistData.ensure_mnist(data_dir, 1, download, loc_im, loc_lb) != 0:
+                stdio.printf("数据就绪失败, 请检查 --file 路径 / 网络 / data-dir\n")
+                return 1
+        cap2: sizet = sizet(10000)
+        if limit > 0 and limit < 10000:
+            cap2 = sizet(limit)
+        xbuf2: double* = stdlib.malloc(cap2 * MnistData.N_IN * 8)
+        ybuf2: int* = stdlib.malloc(cap2 * 4)
+        if xbuf2 is None or ybuf2 is None:
+            stdio.printf("FAIL: 测试数据缓冲分配失败\n")
+            return 1
+        n_te: sizet = MnistData.load_mnist_images(p_img, xbuf2, cap2)
+        n_tl: sizet = MnistData.load_mnist_labels(p_lbl, ybuf2, cap2)
+        if n_tl < n_te:
+            n_te = n_tl
+        stdio.printf("加载测试样本=%zu 张\n", n_te)
+        if n_te == 0:
+            return 1
+        if MnistNet.load_model(net2, load_path) != 0:
+            stdio.printf("加载模型失败, 请先训练(--mode train)\n")
+            return 1
+        stdio.printf("加载模型: %s  (%s, hidden=%d)\n",
+                     load_path, MnistNet.arch_name(f_arch), f_hidden)
+        MnistNet.evaluate_net(pool, net2, xbuf2, ybuf2, n_te,
+                              sizet(batch), sizet(show))
+        stdlib.free(xbuf2)
+        stdlib.free(ybuf2)
+    else:
+        stdio.printf("未知模式: %s (可选 train/use)\n", mode)
+        return 1
+
+    stdlib.free(p_img)
+    stdlib.free(p_lbl)
+    return 0
+
+
+# ============================================================
+# 入口
+# ============================================================
+def main() -> int:
+    # UTF-8 控制台(与 TransPyV main 一致)
+    w32cmd.SetConsoleOutputCP(CODE_PAGE)
+    w32cmd.SetConsoleCP(CODE_PAGE)
+
+    # 主内存池: CLI 与 GUI 共用, 先建池再解析 argv(GUI 分支也需要池)
+    arena: bytes = stdlib.malloc(POOL_SIZE)
+    if arena is None:
+        stdio.printf("FAIL: 无法分配主池\n")
+        return 1
+    mb: memhub.MemBuddy* = memhub.MemBuddy(arena, POOL_SIZE, 0)
+    if mb is None:
+        stdio.printf("FAIL: MemBuddy 初始化失败\n")
+        return 1
+    argparse._mbuddy = mb
+    sys._mbuddy = mb
+    requests._mbuddy = mb     # requests/https 内部用 _mbuddy 分配响应缓冲
+    sys._init_argv()
+
+    # 无参数 → Qt 面板; 有参数 → CLI
+    if sys._argc <= 1:
+        return AppGui.run(mb)
+    return run_cli(mb)

@@ -1,0 +1,13 @@
+*.o
+*.obj
+*.exe
+*.img
+*.iso
+**/__pycache__/
+.cache/
+*.pyc
+
+# 编译
+**/output/
+**/temp/
+**/.tpv_build/

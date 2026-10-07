@@ -1,0 +1,12 @@
+import t, c
+import stdio
+
+
+export def main() -> int:
+    print("main2.m")
+    i: int = 10
+    k: int* = &i
+    stdio.printf("%d\n", *k)
+    a: size_t = len("Hello")
+    stdio.printf("%d\n", a)
+    return 0

@@ -1,0 +1,72 @@
+{
+    "name": "ViperMNIST",
+    "version": "2.0.0",
+    "description": "MNIST 手写数字识别(28x28 灰度, 两层 MLP): 无参数启动 vqt6 Qt 面板(数据/训练/推理 + 3D 网络图 + Qt Charts 曲线), 带参数走原 CLI(train/use); 计算走 includes/torch (仿 PyTorch 迷你库, 线性层内积 vipersimd dot4/relu max4d)",
+    "source_dir": "./App",
+    "build_dir": "./.tpv_build",
+    "compiler": {
+        "cmd": "llc",
+        "flags": [
+            "-filetype=obj",
+            "-relocation-model=pic"
+        ]
+    },
+    "linker": {
+        "cmd": "D:/msys64/mingw64/bin/clang++.exe",
+        "flags": [
+            "-fuse-ld=lld",
+            "-lmsvcrt",
+            "-lpthread",
+            "-lmingwex",
+            "-lkernel32",
+            "-lws2_32",
+            "-ldnsapi",
+            "-liphlpapi",
+            "-lgdi32",
+            "-lcrypt32",
+            "-ladvapi32",
+            "-L", "D:/Qt/6.11.2/mingw_64/lib",
+            "-lQt6Core",
+            "-lQt6Gui",
+            "-lQt6Widgets",
+            "-lQt6Network",
+            "-lQt6Charts",
+            "-lws2_32",
+            "-lcrypt32",
+            "-ladvapi32",
+            "-liphlpapi",
+            "-ldnsapi"
+        ],
+        "static_libs": [
+            "../../includes/vqt6/build/lib/libvqt6_bridge.a",
+            "../../dlls/lib/libssl.a",
+            "../../dlls/lib/libcrypto.a"
+        ],
+        "output": "app.exe"
+    },
+    "includes": [
+        "../../includes"
+    ],
+    "target": {
+        "triple": "x86_64-pc-windows-gnu",
+        "datalayout": "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+    },
+    "options": {
+        "slice_level": 3,
+        "sha1_slice_level": 1,
+        "target": "llvm",
+        "strict_mode": true
+    },
+    "runtime": {
+        "qt6_path": "D:/Qt/6.11.2/mingw_64",
+        "qt6_dlls": [
+            "Qt6Core.dll",
+            "Qt6Gui.dll",
+            "Qt6Widgets.dll",
+            "Qt6Network.dll",
+            "Qt6Charts.dll",
+            "Qt6OpenGL.dll",
+            "Qt6OpenGLWidgets.dll"
+        ]
+    }
+}
