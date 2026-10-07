@@ -11,7 +11,7 @@
         ]
     },
     "linker": {
-        "cmd": "D:/msys64/mingw64/bin/clang++.exe",
+        "cmd": "clang++.exe",
         "flags": [
             "-fuse-ld=lld",
             "-lmsvcrt",
