@@ -67,6 +67,7 @@
             "Qt6Charts.dll",
             "Qt6OpenGL.dll",
             "Qt6OpenGLWidgets.dll"
-        ]
+        ],
+        "qt6_plugins": ["platforms/qwindows.dll"]
     }
 }

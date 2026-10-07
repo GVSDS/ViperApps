@@ -47,6 +47,7 @@
     },
     "runtime": {
         "qt6_path": "D:/Qt/6.11.2/mingw_64",
-        "qt6_dlls": ["Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll", "Qt6Network.dll", "Qt6Charts.dll", "Qt6OpenGL.dll", "Qt6OpenGLWidgets.dll"]
+        "qt6_dlls": ["Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll", "Qt6Network.dll", "Qt6Charts.dll", "Qt6OpenGL.dll", "Qt6OpenGLWidgets.dll"],
+        "qt6_plugins": ["platforms/qwindows.dll"]
     }
 }
