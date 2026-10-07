@@ -168,7 +168,7 @@ def download_inflate(url: str, out_path: str) -> int:
         if dst is None:
             requests.release(r)
             return 1
-        n = gzip.gzip_decode_bytes(src, slen, dst, cap)
+        n = gzip._gzip_decode(src, slen, dst, cap)
         if n == -9 or n == -18 or n == -23:
             stdlib.free(dst)
             dst = None
@@ -199,23 +199,26 @@ def inflate_local(gz_path: str, out_path: str) -> int:
     """本地已下载的 .gz → 解压写入 out_path(GzipFile OOP 范式)。0=成功"""
     stdio.printf("[gzip] 本地解压: %s\n", gz_path)
     gz: gzip.GzipFile* = gzip.GzipFile(gz_path)
-    if gz is None or gzip.gzip_ok(gz) == 0:
-        stdio.printf("[gzip] 打开失败(err=%d): %s\n", gzip.gzip_err(gz), gz_path)
+    if gz is None:
+        stdio.printf("[gzip] 打开失败: %s\n", gz_path)
         return 1
-    buf: BYTEPTR = gzip.gzip_read(gz)
-    n: sizet = gzip.gzip_dst_len(gz)
+    if gz.ok == 0:
+        stdio.printf("[gzip] 打开失败(err=%d): %s\n", gz.err, gz_path)
+        return 1
+    buf: BYTEPTR = gz.read_all()
+    n: sizet = gz.dst_len
     if buf is None or n == 0:
-        stdio.printf("[gzip] 解压失败(err=%d): %s\n", gzip.gzip_err(gz), gz_path)
-        gzip.gzip_close(gz)
+        stdio.printf("[gzip] 解压失败(err=%d): %s\n", gz.err, gz_path)
+        gz.close()
         return 1
     f: fileio.File* = fileio.File(out_path, fileio.MODE.W)
     if f.closed:
         stdio.printf("[gzip] 无法写入: %s\n", out_path)
-        gzip.gzip_close(gz)
+        gz.close()
         return 1
     f.write(buf, ULONG(n))
     f.close()
-    gzip.gzip_close(gz)
+    gz.close()
     stdio.printf("[gzip] 已写入 %s (%zu 字节)\n", out_path, n)
     return 0
 

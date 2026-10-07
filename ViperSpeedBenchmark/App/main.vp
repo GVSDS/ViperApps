@@ -43,7 +43,7 @@
 # ============================================================
 from stdint import *
 import vipersimd
-import vipermath
+import math as vipermath
 import stdlib
 import stdio
 import t
