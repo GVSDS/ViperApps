@@ -676,7 +676,7 @@ def main() -> int:
     leaf.setChecked(1)
     leaf.setSize(1200)
     g1.addChild(leaf)
-    leaf = vqt6.QTreeWidgetItem("网络与调试工具（QtNetwork + TPV）[220 MB]")
+    leaf = vqt6.QTreeWidgetItem("网络与调试工具（QtNetwork + VPC）[220 MB]")
     leaf.setCheckable(1)
     leaf.setChecked(0)
     leaf.setSize(220)

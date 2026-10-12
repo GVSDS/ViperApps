@@ -188,7 +188,7 @@ NATIVE_FLAGS = ["-O2", "-mavx2", "-mfma", "-ffp-contract=fast"]
 
 
 # Viper 内核实现名 -> (传给 app.exe 的第 4 个参数 mode, 显示名)。
-# 全部共用同一个 .tpv_build/output/app.exe, 只差这一个 mode 参数 —— 除"跑哪份内核"
+# 全部共用同一个 __vpcbuild__/output/app.exe, 只差这一个 mode 参数 —— 除"跑哪份内核"
 # 外没有任何差异, 这是 SIMD vs 原生 对照可信的前提(见 App/main.vp 的 KERNEL_* 常量)。
 # 命名规则: `<op>` = SIMD, `scalar_<op>` = 同操作的标量(原生)对照。
 VIPER_KERNELS = [
@@ -257,7 +257,7 @@ def iters_for(size):
 
 
 def viper_exe(root):
-    return root / ".tpv_build" / "output" / "app.exe"
+    return root / "__vpcbuild__" / "output" / "app.exe"
 
 
 # ------------------------------------------------------------
@@ -431,7 +431,7 @@ def build_arg_parser():
     p.add_argument("--py-mode", default=None, choices=["auto", "numpy", "pure"],
                    help="覆盖 bench_py.py 的运行模式(auto/numpy/pure)")
     p.add_argument("--viper-exe", default=None,
-                   help="覆盖 Viper 产物路径(默认 .tpv_build/output/app.exe)")
+                   help="覆盖 Viper 产物路径(默认 __vpcbuild__/output/app.exe)")
     p.add_argument("--flops-check", action="store_true",
                    help="核对 RESULT 行的 flops 字段是否与 CFG 总运算量一致, "
                         "并报告 flops≈2e9(时长≈1s)的行占比及降规模提示")
@@ -536,7 +536,7 @@ def main(argv=None):
                  + ", ".join(f"{n}(mode={VIPER_MODE[n]})" for n in viper_wanted))
         else:
             emit(f"[viper] 未找到 Viper 产物: {vpy_exe}")
-            emit("  请先在本工程目录用 tpv 构建 project.vpj(生成 .tpv_build/output/app.exe),")
+            emit("  请先在本工程目录用 tpv 构建 project.vpj(生成 __vpcbuild__/output/app.exe),")
             emit("  本次将跳过全部 Viper 内核变体。")
 
     # ---- 逐尺寸 × 逐实现跑测(每组=一次进程启动) ----
@@ -804,7 +804,7 @@ def main(argv=None):
              f" | [{lab_other}] {other_us:>11.3f} us {gfl(other_us):>8.3f} GFLOPS"
              f" | {aff_txt} | {'PASS' if st['passed'] else 'FAIL'}")
     if not any(im == "viper" for (_, im) in results):
-        emit("  (viper 已跳过: 请先构建 .tpv_build/output/app.exe)")
+        emit("  (viper 已跳过: 请先构建 __vpcbuild__/output/app.exe)")
     for impl, note in compile_notes:
         emit(f"  ({impl} 已跳过: 编译失败, 见上方)")
     emit("=" * 78)

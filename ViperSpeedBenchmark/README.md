@@ -108,7 +108,7 @@ out[i] = a[i] * b[i] + c[i]        # 元素独立, 单趟融合乘加; 每元素
 
 | 文件 | 说明 |
 | --- | --- |
-| `project.vpj` | Viper 工程配置(产物 `.tpv_build/output/app.exe`) |
+| `project.vpj` | Viper 工程配置(产物 `__vpcbuild__/output/app.exe`) |
 | `App/main.vp` | Viper 实现: 8 个内核(FMA/ADD/MUL/SQRT × SIMD/原生) + 线程绑定 + QPC/周期双计时 + 进程内多 run; 自解析命令行 `[runs] [len] [iters] [mode]`(GetCommandLineA, 不依赖 sys/memhub) |
 | `bench_c.c` | 手写 C: 裸数组 + **全指针 `__restrict`**(fill/内核/校验和/local 指针都加) + noinline, `-O2 -mavx2 -mfma -ffp-contract=fast` 自动向量化单趟 FMA |
 | `bench_cpp.cpp` | 手写 C++: `std::vector` + `__restrict`, 同口径(`-O2 -mavx2 -mfma -ffp-contract=fast`) |
@@ -131,7 +131,7 @@ out[i] = a[i] * b[i] + c[i]        # 元素独立, 单趟融合乘加; 每元素
 ### 5.1 构建 Viper 部分(一次性)
 
 在本工程目录(`ViperSpeedBenchmark/`)用你惯用的 tpv 方式构建 `project.vpj`,
-产物应为 `.tpv_build/output/app.exe`。若未构建, `run_bench.py` 会提示并**跳过
+产物应为 `__vpcbuild__/output/app.exe`。若未构建, `run_bench.py` 会提示并**跳过
 全部 Viper 内核变体** 继续其它实现。
 
 > **改了 `App/main.vp` 或 `includes/vipersimd.vp` 后必须重建**, 否则任一 Viper

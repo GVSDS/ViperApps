@@ -3,7 +3,7 @@
     "version": "0.1.0",
     "description": "vqt6 第一个示例 - 创建一个 Qt6 窗口，点击按钮退出",
     "source_dir": "./App",
-    "build_dir": "./.tpv_build",
+    "build_dir": "./__vpcbuild__",
     "compiler": {
         "cmd": "llc",
         "flags": ["-filetype=obj", "-relocation-model=pic"]

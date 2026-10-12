@@ -269,7 +269,7 @@ def run_cli(pool: memhub.MemBuddy*) -> int:
 # 入口
 # ============================================================
 def main() -> int:
-    # UTF-8 控制台(与 TransPyV main 一致)
+    # UTF-8 控制台(与 ViperC main 一致)
     w32cmd.SetConsoleOutputCP(CODE_PAGE)
     w32cmd.SetConsoleCP(CODE_PAGE)
 

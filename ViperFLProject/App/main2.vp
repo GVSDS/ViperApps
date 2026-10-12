@@ -1,9 +1,9 @@
 # main2.vp — ViperFLProject fltk GUI 测试（回调 + 控件展示）
 #
-# 构建需 TPV/TPC 支持 project.vpj linker.static_libs 静态链接
+# 构建需 VPC/TPC 支持 project.vpj linker.static_libs 静态链接
 # （本工程已配置链接 ../includes/fltk/cfltk/build 下的 cfltk2 + FLTK 静态库）。
 #
-# 回调说明：Viper 模块级函数可直接作为 Fl_Callback 传入（TPV 自动把函数名
+# 回调说明：Viper 模块级函数可直接作为 Fl_Callback 传入（VPC 自动把函数名
 # bitcast 为函数指针）。回调签名统一为 def cb(w: bytes, data: bytes)，
 # 其中 w 是触发回调的控件指针，data 是注册时传入的用户数据。
 import t, c

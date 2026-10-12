@@ -3,7 +3,7 @@
     "version": "1.0.0",
     "description": "同内核多实现测速基准: out[i]=a[i]*b[i]+c[i] (len=16384, iters=65536, 每次run≈2.147e9 flops; 工作集512KiB 常驻私有L2)。Viper 侧第4个命令行参数 mode 可切 8 个内核: FMA/ADD/MUL/SQRT 各一对 SIMD(simd_*_array) 与 原生(scalar_*_array), 用于 SIMD 加速比对照; mode=0 的 FMA SIMD 与 C/C++/Python 对齐",
     "source_dir": "./App",
-    "build_dir": "./.tpv_build",
+    "build_dir": "./__vpcbuild__",
     "compiler": {
         "cmd": "llc",
         "flags": [
