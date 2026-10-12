@@ -2,7 +2,7 @@
 ViperOS/
 
 # 编译产物
-**/.tpv_build/
+**/__vpcbuild__/
 **/.native_build/
 **/output/
 **/output_mlir/
