@@ -10,4 +10,4 @@
 # 编译
 **/output/
 **/temp/
-**/.tpv_build/
+**/__vpcbuild__/
