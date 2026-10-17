@@ -21,7 +21,6 @@
 #   权重形状同 PyTorch: Conv(out,in,k,k) / Linear(out,in), b(out)
 # 计算: torch-lite 线性前向走 vipersimd.simd_dot4d, relu 走 simd_max4d
 # ============================================================
-import t, c
 from stdint import *
 import stdlib
 import string
@@ -31,7 +30,7 @@ import memhub
 import argparse
 import requests
 import torch
-import w32.win32console as w32cmd
+import win32.win32console as win32cmd
 import lib.MnistData as MnistData
 import lib.MnistNet as MnistNet
 import lib.AppGui as AppGui
@@ -270,8 +269,8 @@ def run_cli(pool: memhub.MemBuddy*) -> int:
 # ============================================================
 def main() -> int:
     # UTF-8 控制台(与 ViperC main 一致)
-    w32cmd.SetConsoleOutputCP(CODE_PAGE)
-    w32cmd.SetConsoleCP(CODE_PAGE)
+    win32cmd.SetConsoleOutputCP(CODE_PAGE)
+    win32cmd.SetConsoleCP(CODE_PAGE)
 
     # 主内存池: CLI 与 GUI 共用, 先建池再解析 argv(GUI 分支也需要池)
     arena: bytes = stdlib.malloc(POOL_SIZE)

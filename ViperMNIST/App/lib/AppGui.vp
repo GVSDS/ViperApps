@@ -14,7 +14,6 @@
 # 线程模型: 训练在 vthreading 后台线程跑, 只写 MnistNet 的 prog_* 进度总线;
 #   主线程用 QTimer 轮询刷新界面, 不与之共享 Qt 对象。
 # ============================================================
-import t, c
 from stdint import *
 import stdlib
 import string
@@ -23,8 +22,8 @@ import vthreading
 import memhub
 import torch
 import viperlib
-import w32.fileio as fileio
-import w32.win32file as win32file
+import win32.fileio as fileio
+import win32.win32file as win32file
 import lib.MnistData as MnistData
 import lib.MnistNet as MnistNet
 
@@ -39,8 +38,7 @@ define CHART_KEEP = 800
 define ANIM_SPAN = 16
 
 
-@t.NoVTable
-class AppGui:
+novirtual class AppGui:
     # ---- 应用与主窗 ----
     App: vqt6.QApplication*
     Win: vqt6.QMainWindow*
@@ -78,12 +76,12 @@ class AppGui:
     Pbar: vqt6.QProgressBar*
     Log: vqt6.QPlainTextEdit*
     Chart: vqt6.ChartView*
-    LineLoss: t.CPtr
-    LineAcc: t.CPtr
+    LineLoss: rawptr
+    LineAcc: rawptr
     ChartSynced: int
     # 验证集曲线(每 epoch 一个点, 与训练曲线分开同步)
-    LineValLoss: t.CPtr
-    LineValAcc: t.CPtr
+    LineValLoss: rawptr
+    LineValAcc: rawptr
     ChartSyncedVal: int
 
     # ---- 推理页 ----
@@ -122,7 +120,7 @@ class AppGui:
     # 只存线程句柄: Thread 对象本身是创建帧的栈 alloca, 跨帧持有会悬垂;
     # 句柄由 on_start_train 在 Thread 尚存活时取出, 之后用模块级
     # wait_handle/close_handle 操作。
-    ThreadH: t.CPtr
+    ThreadH: rawptr
     XBuf: double*
     YBuf: int*
     NTrain: sizet
@@ -138,8 +136,8 @@ class AppGui:
     Img28: bytes
     Sample28: bytes
     HaveSample: int
-    TestRaw: t.CPtr
-    TestLbl: t.CPtr
+    TestRaw: rawptr
+    TestLbl: rawptr
     TestN: sizet
     Probs: double*
     HiddenBuf: double*
@@ -337,9 +335,9 @@ class AppGui:
         self.LblStatus = self.make_label("池: 512MB   数据目录: data", "color:#8a93a1;")
         # statusBar() 返回裸指针: 返回包装类对象(按值 struct)的方法在跨模块
         # 调用时返回类型无法精确解析(编译器 fail-fast), 故此处直连 FFI。
-        # 注解写 t.CPtr 而非 vqt6.QtStatusBarPtr —— 跨模块 typedef 注解
+        # 注解写 rawptr 而非 vqt6.QtStatusBarPtr —— 跨模块 typedef 注解
         # 不在解析白名单内, 会走"类型注解解析失败"诊断路径。
-        sb: t.CPtr = self.Win.statusBar()
+        sb: rawptr = self.Win.statusBar()
         vqt6.vqt6_qstatusbar_add_widget(sb, self.LblStatus._ptr, 0)
 
         self.TimerPoll = vqt6.QTimer()
@@ -561,8 +559,8 @@ class AppGui:
         buf: bytes = stdlib.malloc(1024)
         if buf is None:
             return "."
-        # hModule 传空指针用 t.CPtr(0): HANDLE 是 VOIDPTR, 整数 0 不能隐式转指针
-        win32file.GetModuleFileNameA(t.CPtr(0), buf, ULONG(1024))
+        # hModule 传空指针用 None: HANDLE 是 VOIDPTR, 整数 0 不能隐式转指针
+        win32file.GetModuleFileNameA(None, buf, ULONG(1024))
         n: sizet = string.strlen(buf)
         # 第一步: 从右往左找最后一个路径分隔符, 在那里截断(去掉文件名本身)
         cut: sizet = 0
@@ -862,7 +860,7 @@ class AppGui:
         self.BtnTrain.setEnabled(0)
         self.BtnStop.setEnabled(1)
         self.Training = 1
-        th: vthreading.Thread* = vthreading.Thread(WorkerTrain, t.CPtr(0))
+        th: vthreading.Thread* = vthreading.Thread(WorkerTrain, None)
         th.start()
         self.ThreadH = th.handle      # 帧内取出句柄, 之后不再持 Thread 对象
         self.TimerPoll.start(120)
@@ -1024,7 +1022,7 @@ class AppGui:
             return
         idx: sizet = MnistNet.rand_idx(self.TestN)
         lb: uchar* = self.TestLbl
-        src: t.CPtr = self.TestRaw + 16 + idx * MnistData.N_IN
+        src: rawptr = self.TestRaw + 16 + idx * MnistData.N_IN
         string.memcpy(self.Sample28, src, MnistData.N_IN)
         self.HaveSample = 1
         self.Canvas.setImage28(self.Sample28)
@@ -1144,87 +1142,87 @@ class AppGui:
 _g_ui: AppGui*
 
 
-def CbDownload(slot_id: int, data: t.CPtr):
+def CbDownload(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_download()
 
 
-def CbCopyLink(slot_id: int, data: t.CPtr):
+def CbCopyLink(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_copy_link()
 
 
-def CbPickDir(slot_id: int, data: t.CPtr):
+def CbPickDir(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_pick_dir()
 
 
-def CbCheckData(slot_id: int, data: t.CPtr):
+def CbCheckData(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.check_data()
 
 
-def CbPickLocal(slot_id: int, data: t.CPtr):
+def CbPickLocal(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_pick_local()
 
 
-def CbArchChanged(slot_id: int, data: t.CPtr):
+def CbArchChanged(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_arch_changed()
 
 
-def CbStartTrain(slot_id: int, data: t.CPtr):
+def CbStartTrain(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_start_train()
 
 
-def CbStopTrain(slot_id: int, data: t.CPtr):
+def CbStopTrain(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_stop_train()
 
 
-def CbZoomChart(slot_id: int, data: t.CPtr):
+def CbZoomChart(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_zoom_chart()
 
 
-def CbPollTraining(slot_id: int, data: t.CPtr):
+def CbPollTraining(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_poll_training()
 
 
-def CbLoadModel(slot_id: int, data: t.CPtr):
+def CbLoadModel(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_load_model()
 
 
-def CbPickSample(slot_id: int, data: t.CPtr):
+def CbPickSample(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_pick_sample()
 
 
-def CbClearCanvas(slot_id: int, data: t.CPtr):
+def CbClearCanvas(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_clear_canvas()
 
 
-def CbCanvasChanged(slot_id: int, data: t.CPtr):
+def CbCanvasChanged(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_canvas_changed()
 
 
-def CbUse(slot_id: int, data: t.CPtr):
+def CbUse(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_use()
 
 
-def CbAnimTick(slot_id: int, data: t.CPtr):
+def CbAnimTick(slot_id: int, data: rawptr):
     if _g_ui is not None:
         _g_ui.on_anim_tick()
 
 
-def WorkerTrain(arg: t.CPtr) -> t.CPtr:
+def WorkerTrain(arg: rawptr) -> rawptr:
     """后台训练线程入口"""
     if _g_ui is not None:
         _g_ui.worker_train()

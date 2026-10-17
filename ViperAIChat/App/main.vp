@@ -27,7 +27,7 @@ import vthreading
 import requests
 import requests.https as rhttps
 import json
-import w32.win32memory as win32mem
+import win32.win32memory as win32mem
 
 
 # ============================================================

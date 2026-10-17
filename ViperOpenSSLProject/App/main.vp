@@ -6,12 +6,10 @@
 #
 # 链接目标尚未定（msys2 预装 3.6.2 动态库 或 openssl_358_C 自编译），
 # 配好 project.vpj 的 -lcrypto/-lssl（或 static_libs）后才可链接运行。
-import t, c
 import stdlib
 import binascii
 import openssl
-import w32.win32console as w32cmd
-import viperlib
+import win32.win32console as win32cmd
 
 
 def print_digest(name: str, buf: bytes, length: int):
@@ -20,8 +18,8 @@ def print_digest(name: str, buf: bytes, length: int):
 
 
 def main() -> int:
-    w32cmd.SetConsoleOutputCP(65001)
-    w32cmd.SetConsoleCP(65001)
+    win32cmd.SetConsoleOutputCP(65001)
+    win32cmd.SetConsoleCP(65001)
 
     # ---- 1) 版本 ----
     ver: str = openssl.OpenSSL_version(openssl.OpenSslVersion)
@@ -31,7 +29,7 @@ def main() -> int:
 
     # ---- 2) 摘要 ----
     data: str = "hello openssl"
-    dlen: int = len(data)
+    dlen: int = int(len(data))
 
     md5_buf: bytes = stdlib.malloc(openssl.Md5DigestLength)
     openssl.MD5(data, dlen, md5_buf)

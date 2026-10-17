@@ -5,14 +5,13 @@
 #   2) ZipFile("r") reads back: entry count / name / size / compress_size checks + per-member content compare
 #      (CRC32 verification is done inside zipfile.read)
 #   3) Corrupt one payload byte of a stored member -> a second read must return None with error ZIP_ERR_CRC
-import t, c
 from stdint import *
 import stdio
 import stdlib
 import string
 import zipfile
-import w32.win32base as wb
-import w32.win32file as wf
+import win32.win32base as wb
+import win32.win32file as wf
 
 
 ZIP_PATH: str = "zip_roundtrip.zip"

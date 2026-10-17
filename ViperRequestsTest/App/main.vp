@@ -7,7 +7,6 @@
 #   4) rhttps.post             - HTTPS POST
 #
 # Usage: requests._mbuddy = my_mbuddy (https reuses the same memory pool)
-import t, c
 from stdint import *
 import stdio
 import stdlib
@@ -18,8 +17,8 @@ import requests
 import requests.https as rhttps
 import requests.download as rd
 import zlib.pyzlib as pyzlib
-import w32.win32file as wf
-import w32.win32base as wb
+import win32.win32file as wf
+import win32.win32base as wb
 
 
 # Global MBuddy pointer

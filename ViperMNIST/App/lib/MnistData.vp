@@ -11,14 +11,13 @@
 # 说明: fileio.File.read_all 契约是"最多读 max_count-1 字节并补 NUL",
 #   故所有整读调用都按 目标长度+1 申请与请求, 否则会丢最后一字节。
 # ============================================================
-import t, c
 from stdint import *
 import stdlib
 import string
 import stdio
 import viperlib
 import os
-import w32.fileio as fileio
+import win32.fileio as fileio
 import gzip
 import requests
 import requests.https as reqhttps
@@ -34,20 +33,20 @@ MNIST_BASE: str = "https://ossci-datasets.s3.amazonaws.com/mnist"
 # ============================================================
 # 基础读写
 # ============================================================
-def be32(buf: t.CPtr, off: sizet) -> uint32:
+def be32(buf: rawptr, off: sizet) -> uint32:
     """IDX 大端 u32"""
     ub: uchar* = buf
     return (uint32(ub[off]) << 24) | (uint32(ub[off + 1]) << 16) \
         | (uint32(ub[off + 2]) << 8) | uint32(ub[off + 3])
 
 
-def read_file_all(path: str, fsize: sizet) -> t.CPtr:
+def read_file_all(path: str, fsize: sizet) -> rawptr:
     """整读文件到 malloc 缓冲, 失败返回 None
     注意: read_all 最多读 max_count-1 字节并补 NUL, 故按 fsize+1 申请/请求"""
     f: fileio.File* = fileio.File(path, fileio.MODE.R)
     if f.closed:
         return None
-    buf: t.CPtr = stdlib.malloc(fsize + 1)
+    buf: rawptr = stdlib.malloc(fsize + 1)
     if buf is None:
         f.close()
         return None
@@ -102,7 +101,7 @@ def idx_usable(path: str, is_lb: int) -> int:
     if sz < 16:
         f.close()
         return 0
-    hdr: t.CPtr = stdlib.malloc(64)
+    hdr: rawptr = stdlib.malloc(64)
     if hdr is None:
         f.close()
         return 0
@@ -161,7 +160,7 @@ def download_inflate(url: str, out_path: str) -> int:
     if cap < 1024:
         cap = 1024
     # 保险起见: ISIZE 与实际不符时报"目标缓冲不足", 就翻倍重试(正常情况下一次成功)
-    dst: t.CPtr = None
+    dst: rawptr = None
     n: LONG = 0
     while True:
         dst = stdlib.malloc(cap)
@@ -378,7 +377,7 @@ def load_mnist_images(path: str, dst: double*,
         f.close()
         return 0
     f.close()
-    whole: t.CPtr = read_file_all(path, sizet(sz))
+    whole: rawptr = read_file_all(path, sizet(sz))
     if whole is None:
         stdio.printf("[mnist] 读取失败: %s\n", path)
         return 0
@@ -426,7 +425,7 @@ def load_mnist_labels(path: str, dst: int*,
         f.close()
         return 0
     f.close()
-    whole: t.CPtr = read_file_all(path, sizet(sz))
+    whole: rawptr = read_file_all(path, sizet(sz))
     if whole is None:
         return 0
     # IDX 标签魔数: 00 00 08 01

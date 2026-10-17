@@ -12,7 +12,6 @@
 # 进度总线: train_run 每个记录点写入 prog_* 数组, UI 线程只读轮询;
 #   prog_stop 置 1 可请求提前结束(训练线程在下一个 step 边界退出)。
 # ============================================================
-import t, c
 from stdint import *
 import stdlib
 import string
@@ -20,7 +19,7 @@ import stdio
 import math
 import memhub
 import torch
-import w32.fileio as fileio
+import win32.fileio as fileio
 # 输入/输出维度与数据层保持单一定义, 避免两处各写一份导致漂移
 from lib.MnistData import N_IN, N_OUT
 
@@ -80,16 +79,15 @@ define GRAPH_IN_SIDE = 8
 define NET_BYTES = 480
 
 
-def _zeros_raw(pool: memhub.MemBuddy*, nb: sizet) -> t.CPtr:
+def _zeros_raw(pool: memhub.MemBuddy*, nb: sizet) -> rawptr:
     """从内存池分配并清零一块裸缓冲(动量缓冲用; pool.alloc 不保证清零)"""
-    p: t.CPtr = pool.alloc(nb)
+    p: rawptr = pool.alloc(nb)
     if p is not None:
         string.memset(p, 0, nb)
     return p
 
 
-@t.NoVTable
-class Net:
+novirtual class Net:
     # --- 通用 (1-4) ---
     Arch: sizet                       # 1  ARCH_MLP / ARCH_CNN
     Hidden: sizet                     # 2  MLP 隐藏层宽度; CNN 的 FC1 宽度
@@ -110,28 +108,28 @@ class Net:
     wf2: torch.Tensor*           # 15
     bf2: torch.Tensor*           # 16
     # --- CNN 前向激活 (17-26) ---
-    BZ1: t.CPtr                          # 17 conv1 输出 c1*28*28
-    BA1: t.CPtr                          # 18 relu(BZ1)
-    BP1: t.CPtr                          # 19 pool1 输出 c1*14*14
-    BZ2: t.CPtr                          # 20 conv2 输出 c2*14*14
-    BA2: t.CPtr                          # 21 relu(BZ2)
-    BP2: t.CPtr                          # 22 pool2 输出 c2*7*7(FC1 的输入)
-    BZ3: t.CPtr                          # 23 fc1 输出 h
-    BA3: t.CPtr                          # 24 relu(BZ3)
-    BLG: t.CPtr                          # 25 logits 10
-    BDA3: t.CPtr                         # 26 fc1 输出的梯度 h
+    BZ1: rawptr                          # 17 conv1 输出 c1*28*28
+    BA1: rawptr                          # 18 relu(BZ1)
+    BP1: rawptr                          # 19 pool1 输出 c1*14*14
+    BZ2: rawptr                          # 20 conv2 输出 c2*14*14
+    BA2: rawptr                          # 21 relu(BZ2)
+    BP2: rawptr                          # 22 pool2 输出 c2*7*7(FC1 的输入)
+    BZ3: rawptr                          # 23 fc1 输出 h
+    BA3: rawptr                          # 24 relu(BZ3)
+    BLG: rawptr                          # 25 logits 10
+    BDA3: rawptr                         # 26 fc1 输出的梯度 h
     # --- CNN 反向梯度 (27-34) ---
-    BDLG: t.CPtr                         # 27 dlogits 10
-    BGZ3: t.CPtr                         # 28 fc1 反传的预激活梯度 h
-    BGP2: t.CPtr                         # 29 fc1 反传的输入梯度 49*c2
-    BGA2: t.CPtr                         # 30 relu2 的输入梯度 c2*14*14
-    BGZ2: t.CPtr                         # 31 pool2 反传结果 c2*14*14
-    BGP1: t.CPtr                         # 32 conv2 反传的输入梯度 c1*14*14
-    BGA1: t.CPtr                         # 33 relu1 的输入梯度 c1*28*28
-    BGZ1: t.CPtr                         # 34 pool1 反传结果 c1*28*28
+    BDLG: rawptr                         # 27 dlogits 10
+    BGZ3: rawptr                         # 28 fc1 反传的预激活梯度 h
+    BGP2: rawptr                         # 29 fc1 反传的输入梯度 49*c2
+    BGA2: rawptr                         # 30 relu2 的输入梯度 c2*14*14
+    BGZ2: rawptr                         # 31 pool2 反传结果 c2*14*14
+    BGP1: rawptr                         # 32 conv2 反传的输入梯度 c1*14*14
+    BGA1: rawptr                         # 33 relu1 的输入梯度 c1*28*28
+    BGZ1: rawptr                         # 34 pool1 反传结果 c1*28*28
     # --- CNN 池化 argmax (35-36) ---
-    ARG1: t.CPtr                         # 35 pool1 窗口内下标(int) c1*14*14
-    ARG2: t.CPtr                         # 36 pool2 窗口内下标(int) c2*7*7
+    ARG1: rawptr                         # 35 pool1 窗口内下标(int) c1*14*14
+    ARG2: rawptr                         # 36 pool2 窗口内下标(int) c2*7*7
     # --- FC 层 2D 视图壳 (37-44, 每步复用不再分配) ---
     VF: torch.Tensor*            # 37 (1, 49*c2) 复用 BP2
     VZ3: torch.Tensor*           # 38 (1, h) 复用 BZ3
@@ -148,27 +146,27 @@ class Net:
     GBF2: torch.Tensor*          # 48
     # --- MLP 动量缓冲 (49-52) ---
     # 重球法的速度项, 与参数同元素个数, 训练开始前清零; 只训练时用
-    Mw1: t.CPtr                          # 49
-    Mb1: t.CPtr                          # 50
-    Mw2: t.CPtr                          # 51
-    Mb2: t.CPtr                          # 52
+    Mw1: rawptr                          # 49
+    Mb1: rawptr                          # 50
+    Mw2: rawptr                          # 51
+    Mb2: rawptr                          # 52
     # --- CNN 动量缓冲 (53-60) ---
-    Mwc1: t.CPtr                         # 53
-    Mbc1: t.CPtr                         # 54
-    Mwc2: t.CPtr                         # 55
-    Mbc2: t.CPtr                         # 56
-    Mwf1: t.CPtr                         # 57
-    Mbf1: t.CPtr                         # 58
-    Mwf2: t.CPtr                         # 59
-    Mbf2: t.CPtr                         # 60
+    Mwc1: rawptr                         # 53
+    Mbc1: rawptr                         # 54
+    Mwc2: rawptr                         # 55
+    Mbc2: rawptr                         # 56
+    Mwf1: rawptr                         # 57
+    Mbf1: rawptr                         # 58
+    Mwf2: rawptr                         # 59
+    Mbf2: rawptr                         # 60
 
     def __new__(self, pool: memhub.MemBuddy*, hidden: sizet,
                 arch: sizet = ARCH_MLP, c1: sizet = 0,
-                c2: sizet = 0) -> t.CPtr:
+                c2: sizet = 0) -> rawptr:
         # 网络对象要跨帧存活(Qt 面板里存在 AppGui.Net 字段上, 训练线程还要读),
         # 而类实例默认是创建函数的栈 alloca —— 必须堆分配。
         # 整体清零: 未用到的架构字段保持 NULL, 由 ok()/前向按 arch 判断。
-        p: t.CPtr = pool.alloc(NET_BYTES)
+        p: rawptr = pool.alloc(NET_BYTES)
         if p is not None:
             string.memset(p, 0, NET_BYTES)
         return p
@@ -413,7 +411,7 @@ def batch_accuracy(logits: torch.Tensor*,
 # 反向顺序: logits -> fc2 -> relu3 -> fc1 -> pool2 -> relu2 -> conv2
 #           -> pool1 -> relu1 -> conv1
 # ============================================================
-def relu_raw(x: t.CPtr, out: t.CPtr, n: sizet):
+def relu_raw(x: rawptr, out: rawptr, n: sizet):
     """out = max(0, x) 逐元素(裸缓冲版, 免去给 4D 缓冲造 2D 视图壳)"""
     if x is None or out is None:
         return
@@ -427,7 +425,7 @@ def relu_raw(x: t.CPtr, out: t.CPtr, n: sizet):
             od[i] = double(0.0)
 
 
-def relu_raw_bwd(za: t.CPtr, g: t.CPtr, gz: t.CPtr, n: sizet):
+def relu_raw_bwd(za: rawptr, g: rawptr, gz: rawptr, n: sizet):
     """gz = g * (za > 0) —— za 是 relu 的输入(预激活)缓冲"""
     if za is None or g is None or gz is None:
         return
@@ -441,7 +439,7 @@ def relu_raw_bwd(za: t.CPtr, g: t.CPtr, gz: t.CPtr, n: sizet):
             od[i] = double(0.0)
 
 
-def cnn_forward(net: Net*, img: t.CPtr):
+def cnn_forward(net: Net*, img: rawptr):
     """img: 784 个 0..1 归一化灰度(double 缓冲); logits 落在 net.BLG"""
     if net is None or img is None:
         return
@@ -485,7 +483,7 @@ def cnn_zero_grads(net: Net*):
     torch.zero_grad(net.bf2)
 
 
-def cnn_backward(net: Net*, img: t.CPtr, label: int) -> double:
+def cnn_backward(net: Net*, img: rawptr, label: int) -> double:
     """反向累积一个样本的参数梯度, 返回该样本交叉熵损失
     img 必须与 cnn_forward 传入的是同一块缓冲(conv1 反向要用它)"""
     if net is None:
@@ -500,7 +498,7 @@ def cnn_backward(net: Net*, img: t.CPtr, label: int) -> double:
     s1: sizet = sizet(CNN_SIDE1)
     n1: sizet = c1 * s * s
     n2: sizet = c2 * s1 * s1
-    loss_buf: t.CPtr = stdlib.malloc(8)
+    loss_buf: rawptr = stdlib.malloc(8)
     lab: int* = stdlib.malloc(4)
     if loss_buf is None or lab is None:
         if loss_buf is not None:
@@ -576,7 +574,7 @@ def _write_tensor(f: fileio.File*, x: torch.Tensor*) -> sizet:
     return nb
 
 
-def _read_tensor(whole: t.CPtr, off: sizet,
+def _read_tensor(whole: rawptr, off: sizet,
                  x: torch.Tensor*) -> sizet:
     """从整块缓冲的 off 处读一个张量, 返回新偏移(0 表示失败)"""
     nb: sizet = _bytes_of(x)
@@ -656,7 +654,7 @@ def load_model_mk1(path: str, w1: torch.Tensor*,
         stdio.printf("[model] 文件过小: %s\n", path)
         return 1
     # read_all 契约: 最多读 max_count-1 字节, 故 +1
-    whole: t.CPtr = stdlib.malloc(sizet(sz) + 1)
+    whole: rawptr = stdlib.malloc(sizet(sz) + 1)
     if whole is None:
         return 1
     fr: fileio.File* = fileio.File(path, fileio.MODE.R)
@@ -756,7 +754,7 @@ def load_model_mk2(path: str, net: Net*) -> int:
         stdio.printf("[model] 尺寸不匹配(期望字节=%zu, 实得=%zu)\n",
                      expect, sizet(sz))
         return 1
-    whole: t.CPtr = stdlib.malloc(sizet(sz) + 1)
+    whole: rawptr = stdlib.malloc(sizet(sz) + 1)
     if whole is None:
         return 1
     fr: fileio.File* = fileio.File(path, fileio.MODE.R)
@@ -994,11 +992,11 @@ def ce_from_logits(lg: double*, off: sizet, c: sizet,
             mx = d[off + j]
     s: double = double(0.0)
     for j in range(c):
-        s = s + vipermath.exp(d[off + j] - mx)
+        s = s + math.exp(d[off + j] - mx)
     li: sizet = sizet(label)
     if li >= c:
         li = 0
-    return -(d[off + li] - mx - vipermath.log(s))
+    return -(d[off + li] - mx - math.log(s))
 
 
 def epoch_lr(lr: double, epoch: sizet, epochs: sizet) -> double:
@@ -1307,7 +1305,7 @@ def _train_cnn(pool: memhub.MemBuddy*,
     # 单样本输入缓冲: MnistData.load_mnist_images 已把像素归一化到 0..1,
     # 这里只做搬运(可选平移增强), 不再二次除以 255 —— conv 只吃 double,
     # 且反向 conv1 要用与 forward 同一块缓冲。
-    in_buf: t.CPtr = stdlib.malloc(N_IN * 8)
+    in_buf: rawptr = stdlib.malloc(N_IN * 8)
     if in_buf is None:
         prog_fail = 1
         prog_done = 1
@@ -1513,11 +1511,11 @@ def predict_full(w1: torch.Tensor*, b1: torch.Tensor*,
             mx = lgl[ci]
     s: double = double(0.0)
     for ci in range(N_OUT):
-        s = s + vipermath.exp(lgl[ci] - mx)
+        s = s + math.exp(lgl[ci] - mx)
     best: int = 0
     bv: double = double(-1.0)
     for ci in range(N_OUT):
-        p: double = vipermath.exp(lgl[ci] - mx) / s
+        p: double = math.exp(lgl[ci] - mx) / s
         if out_probs is not None:
             op: double* = out_probs
             op[ci] = p
@@ -1541,7 +1539,7 @@ def predict_cnn(net: Net*, img28: bytes,
     if net is None or img28 is None:
         return -1
     h: sizet = net.Hidden
-    xbuf: t.CPtr = stdlib.malloc(N_IN * 8)
+    xbuf: rawptr = stdlib.malloc(N_IN * 8)
     if xbuf is None:
         return -1
     x: double* = xbuf
@@ -1558,13 +1556,13 @@ def predict_cnn(net: Net*, img28: bytes,
             mx = ld[ci]
     s: double = double(0.0)
     for ci in range(N_OUT):
-        s = s + vipermath.exp(ld[ci] - mx)
+        s = s + math.exp(ld[ci] - mx)
     if s <= double(0.0):
         return -1
     best: int = 0
     bv: double = double(-1.0)
     for ci in range(N_OUT):
-        p: double = vipermath.exp(ld[ci] - mx) / s
+        p: double = math.exp(ld[ci] - mx) / s
         if out_probs is not None:
             op: double* = out_probs
             op[ci] = p
@@ -1600,7 +1598,7 @@ def evaluate_cnn(net: Net*,
         return double(0.0)
     xd: double* = xbuf
     yd: int* = ybuf
-    in_buf: t.CPtr = stdlib.malloc(N_IN * 8)
+    in_buf: rawptr = stdlib.malloc(N_IN * 8)
     if in_buf is None:
         return double(0.0)
     ind: double* = in_buf

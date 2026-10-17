@@ -15,7 +15,7 @@ import c
 import vqt6
 import stdlib
 import memhub
-import w32.win32console as w32cmd
+import win32.win32console as win32cmd
 import viperlib
 
 define pagecode = 65001
@@ -31,8 +31,8 @@ define POOL_SIZE = 1 * 1024 * 1024
 def main() -> int:
     global _mbuddy
 
-    w32cmd.SetConsoleOutputCP(pagecode)
-    w32cmd.SetConsoleCP(pagecode)
+    win32cmd.SetConsoleOutputCP(pagecode)
+    win32cmd.SetConsoleCP(pagecode)
 
     # 模块内存池 (QApplication([]) 里的 [] 要在这里分配)
     arena: bytes = stdlib.malloc(POOL_SIZE)
